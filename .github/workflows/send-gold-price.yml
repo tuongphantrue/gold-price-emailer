@@ -40,7 +40,7 @@ jobs:
         env:
           TIMEZONE: "Asia/Ho_Chi_Minh"
           STATE_FILE: "state/last_price.json"
-          SEND_ONLY_ON_CHANGE: "true"
+          SEND_ONLY_ON_CHANGE: "false"
           # Last-resort opt-in if you hit a certificate verification error
           # in this step - see README's SSL troubleshooting section before
           # enabling. Set the ALLOW_INSECURE_SSL_FALLBACK repo secret to
