@@ -1,36 +1,42 @@
-# Vietnam Gold Prices (multi-seller, summary + full detail) -> Email (runs on GitHub Actions, no local computer needed)
+# Vietnam Gold & Silver Prices (multi-seller, summary + full detail) -> Email (runs on GitHub Actions, no local computer needed)
 
-This repo emails you Vietnamese gold prices for the major sellers - SJC,
-DOJI, PNJ, Bao Tin Minh Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and
-Ngoc Tham - automatically, using GitHub's free scheduled-workflow runners.
-Nothing needs to run on your own machine.
+This repo emails you Vietnamese gold and silver prices for the major
+sellers - SJC, DOJI, PNJ, Bao Tin Minh Chau, Bao Tin Manh Hai, Phu Quy,
+Mi Hong, Ngoc Tham (gold), plus Phu Quy, DOJI, ANCARAT, BTMC, BTMH, and
+Kim Ngan Phuc (silver) - automatically, using GitHub's free
+scheduled-workflow runners. Nothing needs to run on your own machine.
 
-Each email has two sections:
+Each email has three sections:
 
-1. **Summary** - a comparison table (one row per seller) for gold bars and
-   for gold rings, so you can see at a glance who's cheapest/most
-   expensive right now.
-2. **Full detail per seller** - each seller's complete product breakdown
-   (different bar weights, rings, various jewelry purities, etc.) as its
-   own table, the same level of detail baotinmanhhai.vn's own page used to
-   give for just that one seller - now for all 8.
+1. **Gold summary** - a comparison table (one row per seller) for gold
+   bars and for gold rings, so you can see at a glance who's
+   cheapest/most expensive right now.
+2. **Gold full detail per seller** - each seller's complete product
+   breakdown (different bar weights, rings, various jewelry purities,
+   etc.) as its own table, the same level of detail baotinmanhhai.vn's own
+   page used to give for just that one seller - now for all 8.
+3. **Silver** - a comparison table across the major silver sellers/products
+   (bars in different weights, per brand).
 
 ## Where the data comes from
 
-It scrapes https://giavang.org/ rather than each seller's own site. Most
-sellers' own price pages (SJC, PNJ, DOJI, Mi Hong, and BTMC's page/API) load
-their numbers via JavaScript or block automated fetching outright, so a
-plain Python scraper can't read them. giavang.org is server-rendered and
-already has both a homepage comparison table and a dedicated detail page
-per seller (e.g. `giavang.org/trong-nuoc/sjc/`), so this repo reads those
-instead of maintaining 8+ fragile per-seller scrapers. That means **9
-requests to giavang.org per run** (1 summary page + 8 seller detail pages).
-You can change `SOURCE_URL` / the `SELLERS` list in the script if you'd
-rather point it somewhere else, or add/remove sellers, later.
+- **Gold** comes from https://giavang.org/ - a homepage comparison table
+  plus a dedicated detail page per seller (e.g. `giavang.org/trong-nuoc/sjc/`).
+- **Silver** comes from https://giahanghoa.net/gia-bac - a comparison
+  table across silver sellers.
 
-If one seller's detail page fails to fetch or its markup changes, only
-that seller's section notes the failure (with a link to check manually) —
-the rest of the email still generates and sends normally.
+Both sites are server-rendered. Most individual sellers' own price pages
+(SJC, PNJ, DOJI, Mi Hong, and BTMC's page/API) load their numbers via
+JavaScript or block automated fetching outright, so a plain Python scraper
+can't read them directly - these two aggregator sites sidestep that. That
+means **10 requests per run**: 1 gold summary page + 8 gold seller detail
+pages + 1 silver page. You can change `SOURCE_URL` / `SILVER_URL` / the
+`SELLERS` list in the script if you'd rather point it somewhere else, or
+add/remove sellers, later.
+
+If any single page fails to fetch or its markup changes, only that
+section notes the failure (with a link to check manually) — the rest of
+the email still generates and sends normally.
 
 ## One-time setup (~5 minutes)
 
@@ -115,15 +121,14 @@ skips the email if nothing changed.
 - If the run fails, check the Actions tab -> the failed run -> logs. Common
   causes: a secret is missing/misspelled, the Gmail app password was
   revoked, or giavang.org changed its page markup (see below).
-- Always worth checking the current `robots.txt` / terms of whatever
-  `SOURCE_URL` you're pointed at before running this unattended long-term:
-  https://giavang.org/robots.txt
-- This now makes 9 requests to giavang.org per run (up from 1), since it
-  fetches each seller's detail page in addition to the summary page. At
-  the current every-30-minutes schedule that's about 430 requests/day to
-  their site. If that feels like too much load for a site you don't
-  operate, consider a longer interval (e.g. every 1-3 hours) via the cron
-  line above.
+- Always worth checking the current `robots.txt` / terms of whatever sites
+  you're pointed at before running this unattended long-term, e.g.:
+  https://giavang.org/robots.txt and https://giahanghoa.net/robots.txt
+- This makes 10 requests per run (1 gold summary + 8 gold seller detail
+  pages + 1 silver page). At the current every-30-minutes schedule that's
+  about 480 requests/day combined across the two sites. If that feels like
+  too much load for sites you don't operate, consider a longer interval
+  (e.g. every 1-3 hours) via the cron line above.
 - If a run reports "Parsed 0 table(s)", the site's HTML structure probably
   changed. Open the page, inspect the price tables with your browser's
   dev tools, and adjust `_iter_table_rows` / `parse_gold_prices` in

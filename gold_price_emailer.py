@@ -106,6 +106,20 @@ if os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true":
 
 SOURCE_URL = os.environ.get("SOURCE_URL", "https://giavang.org/")
 DETAIL_BASE_URL = "https://giavang.org/trong-nuoc/"
+SILVER_URL = os.environ.get("SILVER_URL", "https://giahanghoa.net/gia-bac")
+
+# Used to split giahanghoa.net's combined "Brand ProductName" cell back into
+# its two parts (see _split_brand_product). Longest names first, so e.g.
+# "Bảo Tín Minh Châu" matches before a shorter unrelated prefix could.
+SILVER_BRANDS = sorted(
+    [
+        "Phú Quý", "Bảo Tín Minh Châu", "BTMC", "Bảo Tín Mạnh Hải", "BTMH",
+        "DOJI", "PNJ", "ANCARAT", "Ancarat", "Kim Ngân Phúc", "Mi Hồng",
+        "Ngọc Thẩm", "SJC",
+    ],
+    key=len,
+    reverse=True,
+)
 
 # (display name, URL slug) for each seller's own detail page on giavang.org
 SELLERS = [
@@ -260,6 +274,59 @@ def _looks_like_price(s):
     return digits.isdigit() and len(digits) >= 5
 
 
+def parse_silver_table(html):
+    """
+    Parse giahanghoa.net's silver comparison table into a list of
+    {brand, product, buy, sell} rows. That table's first column combines
+    brand and product name in one cell (e.g. "Phú Quý BẠC MIẾNG PHÚ QUÝ
+    999 1 LƯỢNG"), so _split_brand_product pulls them back apart using a
+    known-brand-name match.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows_out = []
+    header_names = {"Thương hiệu", "Mua vào", "Bán ra", "Biến động 24h"}
+    for table in soup.find_all("table"):
+        header_row = table.find("tr")
+        if not header_row:
+            continue
+        header_texts = {c.get_text(strip=True) for c in header_row.find_all(["td", "th"])}
+        if not header_texts & header_names:
+            continue  # not the table we're looking for
+        for tr in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            if not cells or cells[0] in header_names:
+                continue
+            if len(cells) < 3 or not _looks_like_price(cells[1]):
+                continue
+            brand, product = _split_brand_product(cells[0])
+            rows_out.append({"brand": brand, "product": product, "buy": cells[1], "sell": cells[2]})
+    return rows_out
+
+
+def _split_brand_product(combo):
+    for brand in SILVER_BRANDS:
+        if combo.startswith(brand):
+            product = combo[len(brand):].strip()
+            return brand, product or combo
+    return "Khác", combo  # unrecognized brand prefix - keep the row, just unlabeled
+
+
+def fetch_silver():
+    """Fetch + parse the silver comparison table. Returns {"rows": [...]}
+    on success or {"error": "...", "url": SILVER_URL} on failure - a
+    silver-fetch problem never aborts the gold sections of the email.
+    """
+    try:
+        html = fetch_page(SILVER_URL)
+        rows = parse_silver_table(html)
+        if not rows:
+            return {"error": "Could not parse any rows from this page.", "url": SILVER_URL}
+        return {"rows": rows, "url": SILVER_URL}
+    except requests.RequestException as e:
+        print(f"  Failed to fetch silver prices: {e}", file=sys.stderr)
+        return {"error": str(e), "url": SILVER_URL}
+
+
 def fetch_summary():
     """Fetch + parse the homepage comparison tables (one row per seller)."""
     html = fetch_page(SOURCE_URL)
@@ -322,7 +389,33 @@ def _table_html(rows, label_header):
         </table>"""
 
 
-def build_html(summary_tables, details, source_url, timestamp):
+def _silver_table_html(rows):
+    row_html = "\n".join(
+        f"<tr>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'><strong>{escape(r['brand'])}</strong></td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(r['product'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['buy'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['sell'])}</td>"
+        f"</tr>"
+        for r in rows
+    )
+    return f"""
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
+          <thead>
+            <tr style="background:#f5f5f5;">
+              <th style="padding:8px 12px;text-align:left;">Thương hiệu</th>
+              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
+              <th style="padding:8px 12px;text-align:right;">Mua vào</th>
+              <th style="padding:8px 12px;text-align:right;">Bán ra</th>
+            </tr>
+          </thead>
+          <tbody>
+            {row_html}
+          </tbody>
+        </table>"""
+
+
+def build_html(summary_tables, details, silver, source_url, timestamp):
     # --- Section 1: summary comparison ---
     if not summary_tables:
         summary_html = (
@@ -352,20 +445,34 @@ def build_html(summary_tables, details, source_url, timestamp):
             detail_parts.append(_table_html(rows, "Loại vàng"))
     detail_html = "\n".join(detail_parts) if detail_parts else "<p>Không có dữ liệu chi tiết.</p>"
 
+    # --- Section 3: silver ---
+    if "error" in silver:
+        silver_html = (
+            f"<p style='color:#a33;font-size:13px;'>Không lấy được giá bạc lần này "
+            f"({escape(silver['error'])}). Xem trực tiếp tại "
+            f"<a href='{escape(silver['url'])}'>{escape(silver['url'])}</a>.</p>"
+        )
+    else:
+        silver_html = _silver_table_html(silver["rows"])
+
     return f"""\
 <html>
   <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
-    <h1 style="color:#b8860b;">Giá vàng hôm nay - các đơn vị lớn tại Việt Nam</h1>
+    <h1 style="color:#b8860b;">Giá vàng &amp; bạc hôm nay - các đơn vị lớn tại Việt Nam</h1>
     <p style="color:#555;">Cập nhật {escape(timestamp)}</p>
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;">Tổng hợp - So sánh giữa các đơn vị</h2>
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;">Vàng - Tổng hợp so sánh giữa các đơn vị</h2>
     {summary_html}
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;margin-top:28px;">Chi tiết đầy đủ theo từng đơn vị</h2>
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;margin-top:28px;">Vàng - Chi tiết đầy đủ theo từng đơn vị</h2>
     {detail_html}
 
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #888;padding-bottom:4px;margin-top:28px;">Bạc - So sánh giữa các đơn vị</h2>
+    {silver_html}
+
     <p style="color:#999; font-size:12px; margin-top:20px;">
-      Nguồn: <a href="{escape(source_url)}">{escape(source_url)}</a> ·
+      Nguồn: <a href="{escape(source_url)}">{escape(source_url)}</a> (vàng),
+      <a href="{escape(SILVER_URL)}">{escape(SILVER_URL)}</a> (bạc) ·
       Đơn vị: nghìn đồng/lượng trừ khi ghi chú khác trên trang gốc ·
       Email tự động, chỉ mang tính tham khảo, không phải lời khuyên đầu tư.
     </p>
@@ -373,8 +480,8 @@ def build_html(summary_tables, details, source_url, timestamp):
 </html>"""
 
 
-def build_plain_text(summary_tables, details, source_url, timestamp):
-    lines = [f"Gia vang hom nay - cap nhat {timestamp}", "", "== TONG HOP =="]
+def build_plain_text(summary_tables, details, silver, source_url, timestamp):
+    lines = [f"Gia vang & bac hom nay - cap nhat {timestamp}", "", "== VANG - TONG HOP =="]
     if not summary_tables:
         lines.append("Could not parse the summary comparison table this run.")
     else:
@@ -386,7 +493,7 @@ def build_plain_text(summary_tables, details, source_url, timestamp):
                 lines.append(f"{r['label']}{region_suffix}: mua {r['buy']} / ban {r['sell']}")
             lines.append("")
 
-    lines.append("== CHI TIET THEO TUNG DON VI ==")
+    lines.append("== VANG - CHI TIET THEO TUNG DON VI ==")
     for name, info in details.items():
         lines.append(f"-- {name} --")
         if "error" in info:
@@ -398,7 +505,16 @@ def build_plain_text(summary_tables, details, source_url, timestamp):
                 lines.append(f"  {r['label']}{region_suffix}: mua {r['buy']} / ban {r['sell']}")
         lines.append("")
 
-    lines.append(f"Nguon: {source_url}")
+    lines.append("== BAC - SO SANH GIUA CAC DON VI ==")
+    if "error" in silver:
+        lines.append(f"  Khong lay duoc gia bac ({silver['error']}). Xem tai {silver['url']}")
+    else:
+        for r in silver["rows"]:
+            lines.append(f"  {r['brand']} - {r['product']}: mua {r['buy']} / ban {r['sell']}")
+    lines.append("")
+
+    lines.append(f"Nguon vang: {source_url}")
+    lines.append(f"Nguon bac: {SILVER_URL}")
     return "\n".join(lines)
 
 
@@ -434,7 +550,12 @@ def cmd_generate():
     if failed:
         print(f"  Failed sellers this run: {', '.join(failed)}", file=sys.stderr)
 
-    combined = {"summary": summary_tables, "details": details}
+    print(f"Fetching silver prices {SILVER_URL} ...")
+    silver = fetch_silver()
+    silver_rows = len(silver.get("rows", []))
+    print(f"Silver: {silver_rows} row(s)." if "rows" in silver else f"Silver: failed ({silver['error']}).")
+
+    combined = {"summary": summary_tables, "details": details, "silver": silver}
     price_hash = hash_data(combined)
     last_hash = load_last_hash()
 
@@ -445,9 +566,9 @@ def cmd_generate():
         return
 
     now, timestamp = resolve_timestamp()
-    subject = f"Gia vang hom nay - {now.strftime('%d/%m/%Y %H:%M')}"
-    html_body = build_html(summary_tables, details, SOURCE_URL, timestamp)
-    text_body = build_plain_text(summary_tables, details, SOURCE_URL, timestamp)
+    subject = f"Gia vang & bac hom nay - {now.strftime('%d/%m/%Y %H:%M')}"
+    html_body = build_html(summary_tables, details, silver, SOURCE_URL, timestamp)
+    text_body = build_plain_text(summary_tables, details, silver, SOURCE_URL, timestamp)
 
     with open(os.path.join(EMAIL_DIR, "subject.txt"), "w") as f:
         f.write(subject)
@@ -457,14 +578,24 @@ def cmd_generate():
         f.write(text_body)
     with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
         json.dump(
-            {"send": True, "summary_rows": summary_rows, "detail_rows": detail_rows, "failed_sellers": failed},
+            {
+                "send": True,
+                "summary_rows": summary_rows,
+                "detail_rows": detail_rows,
+                "failed_sellers": failed,
+                "silver_rows": silver_rows,
+                "silver_ok": "rows" in silver,
+            },
             f,
         )
 
     # Only persist the new hash once the email has actually been composed,
     # mirroring the meme bot's "mark as sent only after it's queued" logic.
     save_last_hash(price_hash)
-    print(f"Generated email ({summary_rows} summary rows, {detail_rows} detail rows). Saved to ./{EMAIL_DIR}/")
+    print(
+        f"Generated email ({summary_rows} summary rows, {detail_rows} detail rows, "
+        f"{silver_rows} silver rows). Saved to ./{EMAIL_DIR}/"
+    )
 
 
 def cmd_send():
