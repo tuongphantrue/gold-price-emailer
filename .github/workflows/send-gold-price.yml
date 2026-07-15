@@ -1,0 +1,67 @@
+name: Send Gold Price
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # every 3 hours, UTC — edit to change frequency
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  send-gold-price:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: send-gold-price
+      cancel-in-progress: false
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Fetch previous dedup state
+        run: |
+          mkdir -p state
+          if git ls-remote --exit-code --heads origin gold-price-state >/dev/null 2>&1; then
+            git fetch --depth 1 origin gold-price-state
+            if git show origin/gold-price-state:state/last_price.json > state/last_price.json 2>/dev/null; then
+              echo "Loaded existing dedup state."
+            else
+              echo "No state/last_price.json on gold-price-state branch yet, starting fresh."
+              rm -f state/last_price.json
+            fi
+          else
+            echo "gold-price-state branch doesn't exist yet, starting fresh."
+          fi
+      - name: Generate email (scrape + build, skips if prices unchanged)
+        env:
+          TIMEZONE: "Asia/Ho_Chi_Minh"
+          STATE_FILE: "state/last_price.json"
+          SEND_ONLY_ON_CHANGE: "true"
+        run: python gold_price_emailer.py generate
+      - name: Publish updated dedup state
+        run: |
+          if [ ! -f state/last_price.json ]; then
+            echo "No state file produced, skipping publish step."
+            exit 0
+          fi
+          rm -rf /tmp/state-repo
+          mkdir /tmp/state-repo
+          cd /tmp/state-repo
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b gold-price-state
+          mkdir -p state
+          cp "$GITHUB_WORKSPACE/state/last_price.json" state/last_price.json
+          git add -A
+          git commit -q -m "Update gold price dedup state - $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -q --force origin gold-price-state
+      - name: Send email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GOLD_RECIPIENT: ${{ secrets.GOLD_RECIPIENT }}
+        run: python gold_price_emailer.py send
