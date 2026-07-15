@@ -1,7 +1,7 @@
 name: Send Gold Price
 on:
   schedule:
-    - cron: "*/30 * * * *" 
+    - cron: "*/30 * * * *"   # every 30 minutes, UTC — edit to change frequency
   workflow_dispatch: {}
 permissions:
   contents: write
@@ -36,7 +36,7 @@ jobs:
           else
             echo "gold-price-state branch doesn't exist yet, starting fresh."
           fi
-      - name: Generate email (scrape + build, skips if prices unchanged)
+      - name: Generate email (scrape + build)
         env:
           TIMEZONE: "Asia/Ho_Chi_Minh"
           STATE_FILE: "state/last_price.json"
