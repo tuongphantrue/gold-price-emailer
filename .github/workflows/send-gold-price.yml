@@ -19,7 +19,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip certifi
+          pip install -r requirements.txt
       - name: Fetch previous dedup state
         run: |
           mkdir -p state
@@ -39,6 +41,11 @@ jobs:
           TIMEZONE: "Asia/Ho_Chi_Minh"
           STATE_FILE: "state/last_price.json"
           SEND_ONLY_ON_CHANGE: "true"
+          # Last-resort opt-in if you hit a certificate verification error
+          # in this step - see README's SSL troubleshooting section before
+          # enabling. Set the ALLOW_INSECURE_SSL_FALLBACK repo secret to
+          # "true" to activate; leave it unset/false otherwise.
+          ALLOW_INSECURE_SSL_FALLBACK: ${{ secrets.ALLOW_INSECURE_SSL_FALLBACK }}
         run: python gold_price_emailer.py generate
       - name: Publish updated dedup state
         run: |
