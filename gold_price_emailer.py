@@ -71,8 +71,17 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
 
+import certifi
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+# Only silences the warning when ALLOW_INSECURE_SSL_FALLBACK is actually
+# used (see fetch_page) - the fallback path itself already prints its own
+# explicit warning to stderr, so this just avoids a duplicate/confusing
+# urllib3 warning on top of it.
+if os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true":
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 SOURCE_URL = os.environ.get("SOURCE_URL", "https://baotinmanhhai.vn/gia-vang-hom-nay")
 
@@ -121,10 +130,44 @@ def hash_rows(rows):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+ALLOW_INSECURE_SSL_FALLBACK = os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true"
+
+
 def fetch_page(url=SOURCE_URL):
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    return resp.text
+    """
+    GET the page, verifying TLS against certifi's CA bundle explicitly.
+
+    requests normally already uses certifi, but pip can end up with a
+    stale certifi wheel cached in a CI runner, which shows up as
+    'unable to get local issuer certificate' even though the site's
+    certificate is fine. Pointing verify= at certifi.where() explicitly
+    (rather than requests' default resolution) sidesteps that, and the
+    workflow also upgrades certifi on every run to keep it fresh.
+
+    If that still fails, ALLOW_INSECURE_SSL_FALLBACK=true retries once
+    with TLS verification disabled — an explicit opt-in last resort, since
+    it means the connection could be tampered with undetected. Leave it
+    "false" unless you've confirmed via README's troubleshooting section
+    that the failure really is a broken certificate chain on the site's
+    end, not a MITM.
+    """
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15, verify=certifi.where())
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.SSLError as e:
+        print(f"  TLS verification failed with certifi's CA bundle: {e}", file=sys.stderr)
+        if not ALLOW_INSECURE_SSL_FALLBACK:
+            print(
+                "  Set ALLOW_INSECURE_SSL_FALLBACK=true to retry without verification "
+                "as a last resort (see README troubleshooting section first).",
+                file=sys.stderr,
+            )
+            raise
+        print("  ALLOW_INSECURE_SSL_FALLBACK=true - retrying with TLS verification disabled.", file=sys.stderr)
+        resp = requests.get(url, headers=HEADERS, timeout=15, verify=False)
+        resp.raise_for_status()
+        return resp.text
 
 
 def parse_gold_prices(html):

@@ -88,6 +88,42 @@ rather get an email every scheduled run regardless.
   browser's dev tools, and adjust `_extract_rows` in
   `gold_price_emailer.py` to match.
 
+## Troubleshooting: SSL certificate errors in Actions
+
+If the "Generate email" step fails with something like:
+
+```
+SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED]
+certificate verify failed: unable to get local issuer certificate ...'))
+```
+
+this means the runner couldn't build a trust chain for baotinmanhhai.vn's
+certificate — usually because the site doesn't send its full intermediate
+certificate chain (something browsers paper over via AIA fetching, but
+Python's TLS stack doesn't do automatically), occasionally because of a
+stale cached `certifi` CA bundle in the runner.
+
+The workflow already upgrades `certifi` fresh on every run, and the script
+points `requests` at that bundle explicitly, which fixes the stale-cache
+case. If it's still failing after that, it's most likely the site's chain
+itself. You can confirm by checking the padlock/certificate details for
+https://baotinmanhhai.vn in a desktop browser — if the browser also warns
+or shows an incomplete chain, that's the site's issue, not this script's.
+
+As a last resort, you can add this secret to opt into skipping TLS
+verification for just this one scrape request:
+
+- In your repo: Settings -> Secrets and variables -> Actions -> "New repository secret"
+- `ALLOW_INSECURE_SSL_FALLBACK` = `true`
+
+and set it as an `env:` var on the "Generate email" step in
+`.github/workflows/send-gold-price.yml`. This is scraping a public price
+page (no login, no credentials in transit), which is why it's offered as
+an opt-in rather than refused outright — but it does mean that particular
+request's response could be tampered with in transit without you knowing,
+so leave it off unless you've confirmed the failure is really the site's
+broken chain.
+
 ## Running locally instead
 
 If you'd rather run this on your own machine instead of GitHub Actions:
