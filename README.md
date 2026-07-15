@@ -1,20 +1,36 @@
-# Vietnam Gold Prices (multi-seller) -> Email (runs on GitHub Actions, no local computer needed)
+# Vietnam Gold Prices (multi-seller, summary + full detail) -> Email (runs on GitHub Actions, no local computer needed)
 
-This repo emails you the current gold price comparison table for the major
-Vietnamese gold sellers - SJC, DOJI, PNJ, Bao Tin Minh Chau, Bao Tin Manh
-Hai, Phu Quy, Mi Hong, and Ngoc Tham - automatically, using GitHub's free
-scheduled-workflow runners. Nothing needs to run on your own machine.
+This repo emails you Vietnamese gold prices for the major sellers - SJC,
+DOJI, PNJ, Bao Tin Minh Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and
+Ngoc Tham - automatically, using GitHub's free scheduled-workflow runners.
+Nothing needs to run on your own machine.
+
+Each email has two sections:
+
+1. **Summary** - a comparison table (one row per seller) for gold bars and
+   for gold rings, so you can see at a glance who's cheapest/most
+   expensive right now.
+2. **Full detail per seller** - each seller's complete product breakdown
+   (different bar weights, rings, various jewelry purities, etc.) as its
+   own table, the same level of detail baotinmanhhai.vn's own page used to
+   give for just that one seller - now for all 8.
 
 ## Where the data comes from
 
 It scrapes https://giavang.org/ rather than each seller's own site. Most
 sellers' own price pages (SJC, PNJ, DOJI, Mi Hong, and BTMC's page/API) load
 their numbers via JavaScript or block automated fetching outright, so a
-plain Python scraper can't read them. giavang.org's homepage is
-server-rendered and already aggregates all of the above into one comparison
-table, so this repo reads that instead of maintaining 7+ fragile
-per-seller scrapers. You can change `SOURCE_URL` (see below) if you'd
-rather point it somewhere else later.
+plain Python scraper can't read them. giavang.org is server-rendered and
+already has both a homepage comparison table and a dedicated detail page
+per seller (e.g. `giavang.org/trong-nuoc/sjc/`), so this repo reads those
+instead of maintaining 8+ fragile per-seller scrapers. That means **9
+requests to giavang.org per run** (1 summary page + 8 seller detail pages).
+You can change `SOURCE_URL` / the `SELLERS` list in the script if you'd
+rather point it somewhere else, or add/remove sellers, later.
+
+If one seller's detail page fails to fetch or its markup changes, only
+that seller's section notes the failure (with a link to check manually) —
+the rest of the email still generates and sends normally.
 
 ## One-time setup (~5 minutes)
 
@@ -102,6 +118,12 @@ skips the email if nothing changed.
 - Always worth checking the current `robots.txt` / terms of whatever
   `SOURCE_URL` you're pointed at before running this unattended long-term:
   https://giavang.org/robots.txt
+- This now makes 9 requests to giavang.org per run (up from 1), since it
+  fetches each seller's detail page in addition to the summary page. At
+  the current every-30-minutes schedule that's about 430 requests/day to
+  their site. If that feels like too much load for a site you don't
+  operate, consider a longer interval (e.g. every 1-3 hours) via the cron
+  line above.
 - If a run reports "Parsed 0 table(s)", the site's HTML structure probably
   changed. Open the page, inspect the price tables with your browser's
   dev tools, and adjust `_iter_table_rows` / `parse_gold_prices` in
@@ -109,11 +131,15 @@ skips the email if nothing changed.
 
 ## Adding/removing sellers or switching source
 
-- **Add Bao Tin Minh Chau's own API or baotinmanhhai.vn back in as a
-  second source**: this would mean fetching a second URL in `cmd_generate`
-  and merging its rows into the `tables` list before building the email -
+- **Add/remove a seller from the detail section**: edit the `SELLERS` list
+  near the top of `gold_price_emailer.py` - it's a list of
+  `(display name, giavang.org URL slug)` pairs. Find a seller's slug from
+  its URL, e.g. `giavang.org/trong-nuoc/sjc/` -> slug is `sjc`.
+- **Add Bao Tin Minh Chau's own API or baotinmanhhai.vn back in as an
+  additional source** (rather than via giavang.org): this would mean
+  fetching that URL separately in `cmd_generate` and merging its rows in -
   ask if you'd like this wired up.
-- **Point at a different aggregator or single seller**: set the
+- **Point the summary section at a different aggregator**: set the
   `SOURCE_URL` environment variable (in the workflow's "Generate email"
   step) to the new URL. If its table markup differs from giavang.org's,
   the parsing functions may need adjusting.

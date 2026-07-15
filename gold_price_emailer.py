@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Vietnam Gold Prices (multi-seller) -> Email (runs on GitHub Actions, no local computer needed)
+Vietnam Gold Prices (multi-seller, summary + full detail) -> Email
+(runs on GitHub Actions, no local computer needed)
 
-Same shape as the 9gag-meme-emailer this is modeled on: fetches the current
-gold price comparison table, then emails an HTML digest via Gmail SMTP.
-Runs in two phases so the workflow can persist dedup state *between* them
-(see the accompanying GitHub Actions workflow):
+Same shape as the 9gag-meme-emailer this is modeled on: fetches gold price
+data, then emails an HTML digest via Gmail SMTP. Runs in two phases so the
+workflow can persist dedup state *between* them (see the accompanying
+GitHub Actions workflow):
 
     python gold_price_emailer.py generate
         -> scrapes the price tables, writes the composed email
@@ -18,21 +19,30 @@ Runs in two phases so the workflow can persist dedup state *between* them
 SOURCE
 ------
 Pulls from https://giavang.org/ — a Vietnamese gold-price aggregator whose
-homepage is server-rendered (unlike most individual sellers' own sites,
-e.g. SJC/DOJI/PNJ/Mi Hong, which load their price tables via JavaScript and
-can't be read by a plain HTTP scraper) and already combines prices from
-SJC, DOJI, PNJ, Bao Tin Minh Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and
-Ngoc Tham into one comparison table, covering the bulk of the top Vietnamese
-gold sellers in a single fetch. Bao Tin Minh Chau also publishes its own
-public price API, and baotinmanhhai.vn has its own price page directly, if
-you'd rather add either of those back in as an additional source later.
+pages are server-rendered (unlike most individual sellers' own sites, e.g.
+SJC/DOJI/PNJ/Mi Hong, which load their price tables via JavaScript and
+can't be read by a plain HTTP scraper).
+
+The email has two sections:
+  1. Summary - the homepage's comparison table (one row per seller, for
+     gold bars and for gold rings), covering SJC, DOJI, PNJ, Bao Tin Minh
+     Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and Ngoc Tham.
+  2. Full detail per seller - each seller also has its own page on
+     giavang.org (e.g. giavang.org/trong-nuoc/sjc/) with a full product
+     breakdown (gold bars in different weights, rings, various jewelry
+     purities, etc). This script fetches all 8 of those pages too and
+     includes each seller's full table as its own section, the same shape
+     baotinmanhhai.vn's own page used to provide for just that one seller.
+
+That's 1 (summary) + 8 (per-seller detail) = 9 requests to giavang.org per
+run. If a single seller's detail page fails to fetch/parse, that one
+section notes the failure and the rest of the email still sends normally.
 
 Unlike the meme bot (which dedups by post ID so it never re-sends the same
 meme), there's no natural "ID" for a price snapshot. Instead this dedups by
 *content*: if SEND_ONLY_ON_CHANGE=true and the scraped prices are
 byte-for-byte identical to the last run's, `generate` skips writing an
-email at all. Defaults to "false" here (send every run) to match the
-current setup - flip to "true" if you want change-only emails again.
+email at all. Defaults to "false" (send every run).
 
 SETUP
 -----
@@ -51,7 +61,7 @@ SETUP
        export GOLD_RECIPIENT="where-to-send@example.com"
        export SEND_ONLY_ON_CHANGE="false"          # optional, default false
        export TIMEZONE="Asia/Ho_Chi_Minh"          # optional, for the subject line
-       export SOURCE_URL="https://giavang.org/"    # optional
+       export SOURCE_URL="https://giavang.org/"    # optional, summary page
        export STATE_FILE="state/last_price.json"   # optional, dedup state file
        export ALLOW_INSECURE_SSL_FALLBACK="false"  # optional, last-resort TLS bypass
 
@@ -62,12 +72,12 @@ schedule in the cloud without needing your own computer on.
 
 NOTE ON SCRAPING
 -----------------
-Always worth checking the current robots.txt / terms of whatever SOURCE_URL
-you point this at before running it unattended long-term, e.g.:
+Always worth checking the current robots.txt / terms of whatever site this
+is pointed at before running it unattended long-term, e.g.:
     https://giavang.org/robots.txt
 The page markup can also change at any time — if `generate` reports 0
-parsed rows, open the page, inspect the price tables, and update the
-parsing functions below.
+parsed rows for a section, open the relevant page, inspect the price
+table, and update the parsing functions below.
 """
 
 import hashlib
@@ -95,6 +105,19 @@ if os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true":
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 SOURCE_URL = os.environ.get("SOURCE_URL", "https://giavang.org/")
+DETAIL_BASE_URL = "https://giavang.org/trong-nuoc/"
+
+# (display name, URL slug) for each seller's own detail page on giavang.org
+SELLERS = [
+    ("SJC", "sjc"),
+    ("DOJI", "doji"),
+    ("PNJ", "pnj"),
+    ("Bảo Tín Minh Châu", "bao-tin-minh-chau"),
+    ("Bảo Tín Mạnh Hải", "bao-tin-manh-hai"),
+    ("Phú Quý", "phu-quy"),
+    ("Mi Hồng", "mi-hong"),
+    ("Ngọc Thẩm", "ngoc-tham"),
+]
 
 HEADERS = {
     "User-Agent": (
@@ -106,7 +129,7 @@ HEADERS = {
 
 EMAIL_DIR = "email"
 
-# Dedup state: a JSON file holding a hash of the last-emailed price tables,
+# Dedup state: a JSON file holding a hash of the last-emailed price data,
 # so re-running periodically can optionally only email when prices actually
 # moved, instead of sending the same numbers repeatedly. The workflow is
 # responsible for fetching this file from the state branch before
@@ -115,15 +138,14 @@ EMAIL_DIR = "email"
 STATE_FILE = os.environ.get("STATE_FILE", "state/last_price.json")
 SEND_ONLY_ON_CHANGE = os.environ.get("SEND_ONLY_ON_CHANGE", "false").lower() == "true"
 
-# Labels for each price table on the page, in the order they appear.
-# giavang.org's homepage currently has two: gold bars, then gold rings.
-# If the site adds/removes a table, extra ones fall back to "Bang N" and
-# missing ones just don't show up - no crash either way.
-TABLE_LABELS = ["Vàng Miếng (gold bars)", "Vàng Nhẫn 1 Chỉ (gold rings)"]
+# Labels for each table on the summary page, in the order they appear.
+SUMMARY_TABLE_LABELS = ["Vàng Miếng (gold bars)", "Vàng Nhẫn 1 Chỉ (gold rings)"]
+
+ALLOW_INSECURE_SSL_FALLBACK = os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true"
 
 
 def load_last_hash(path=STATE_FILE):
-    """Return the previous run's price-table hash, or None if there isn't
+    """Return the previous run's price-data hash, or None if there isn't
     one (missing/corrupt state is treated as "first run", not fatal).
     """
     if not os.path.exists(path):
@@ -142,17 +164,14 @@ def save_last_hash(price_hash, path=STATE_FILE):
         json.dump({"hash": price_hash, "updated": datetime.utcnow().isoformat() + "Z"}, f)
 
 
-def hash_tables(tables):
-    canonical = json.dumps(tables, sort_keys=True, ensure_ascii=False)
+def hash_data(data):
+    canonical = json.dumps(data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-ALLOW_INSECURE_SSL_FALLBACK = os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true"
-
-
-def fetch_page(url=SOURCE_URL):
+def fetch_page(url):
     """
-    GET the page, verifying TLS against certifi's CA bundle explicitly.
+    GET a page, verifying TLS against certifi's CA bundle explicitly.
 
     requests normally already uses certifi, but pip can end up with a
     stale certifi wheel cached in a CI runner, which shows up as
@@ -187,12 +206,13 @@ def fetch_page(url=SOURCE_URL):
         return resp.text
 
 
-def parse_gold_prices(html):
+def parse_comparison_tables(html):
     """
-    Parse every price-comparison table on the page into a list of tables,
-    each a list of {region, seller, buy, sell} rows - one row per unique
-    seller, keeping the first (top) occurrence if a seller appears in more
-    than one region.
+    Parse every price table on a giavang.org page into a list of tables,
+    each a list of {region, label, buy, sell} rows - one row per unique
+    label (a seller name on the summary page, or a product/gold type on a
+    per-seller detail page), keeping the first (top) occurrence if a label
+    appears in more than one region.
 
     giavang.org's tables use an HTML rowspan on the "region" column, so
     only the first row of each region block actually has a region cell -
@@ -203,42 +223,72 @@ def parse_gold_prices(html):
     tables = []
     for table in soup.find_all("table"):
         rows = []
-        seen_sellers = set()
-        for region, seller, buy, sell in _iter_table_rows(table):
-            if not seller or seller in seen_sellers or not _looks_like_price(buy):
+        seen_labels = set()
+        for region, label, buy, sell in _iter_table_rows(table):
+            if not label or label in seen_labels or not _looks_like_price(buy):
                 continue
-            seen_sellers.add(seller)
-            rows.append({"region": region, "seller": seller, "buy": buy, "sell": sell})
-        if len(rows) >= 2:  # ignore stray unrelated tables (nav, footer, etc.)
+            seen_labels.add(label)
+            rows.append({"region": region, "label": label, "buy": buy, "sell": sell})
+        if len(rows) >= 1:  # ignore stray unrelated tables (nav, footer, etc.)
             tables.append(rows)
     return tables
 
 
 def _iter_table_rows(table):
-    """Yield (region, seller, buy, sell) for each data row in a table,
+    """Yield (region, label, buy, sell) for each data row in a table,
     carrying the region forward across rowspan-merged cells.
     """
     current_region = None
-    header_cells = {"Khu vực", "Hệ thống", "Mua vào", "Bán ra"}
+    header_cells = {"Khu vực", "Hệ thống", "Loại vàng", "Mua vào", "Bán ra"}
     for tr in table.find_all("tr"):
         cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
-        cells = [c for c in cells]
         if not cells or all(not c for c in cells):
             continue
         if cells[0] in header_cells:
             continue
         if len(cells) >= 4:
-            current_region, seller, buy, sell = cells[0], cells[1], cells[2], cells[3]
+            current_region, label, buy, sell = cells[0], cells[1], cells[2], cells[3]
         elif len(cells) == 3:
-            seller, buy, sell = cells
+            label, buy, sell = cells
         else:
             continue
-        yield current_region, seller, buy, sell
+        yield current_region, label, buy, sell
 
 
 def _looks_like_price(s):
     digits = re.sub(r"[^\d]", "", s)
     return digits.isdigit() and len(digits) >= 5
+
+
+def fetch_summary():
+    """Fetch + parse the homepage comparison tables (one row per seller)."""
+    html = fetch_page(SOURCE_URL)
+    return parse_comparison_tables(html)
+
+
+def fetch_seller_details():
+    """
+    Fetch + parse each seller's own detail page. Returns an ordered dict
+    (plain dict, Python 3.7+ preserves insertion order) mapping seller
+    display name -> {"tables": [...]} on success, or
+    {"error": "..."} if that one seller's page failed to fetch/parse -
+    a single seller's failure doesn't abort the whole run.
+    """
+    details = {}
+    for name, slug in SELLERS:
+        url = f"{DETAIL_BASE_URL}{slug}/"
+        print(f"Fetching detail page for {name} ({url}) ...")
+        try:
+            html = fetch_page(url)
+            tables = parse_comparison_tables(html)
+            if not tables:
+                details[name] = {"error": "Could not parse any rows from this page.", "url": url}
+            else:
+                details[name] = {"tables": tables, "url": url}
+        except requests.RequestException as e:
+            print(f"  Failed to fetch {name}'s detail page: {e}", file=sys.stderr)
+            details[name] = {"error": str(e), "url": url}
+    return details
 
 
 def _region_span(region):
@@ -247,32 +297,21 @@ def _region_span(region):
     return f" <span style='color:#999;font-size:12px'>({escape(region)})</span>"
 
 
-def build_html(tables, source_url, timestamp):
-    if not tables:
-        body = (
-            "<p>Could not parse any price rows this run. The page structure "
-            f"may have changed — check <a href='{escape(source_url)}'>{escape(source_url)}</a> "
-            "directly, and update the parsing functions in gold_price_emailer.py.</p>"
-        )
-    else:
-        sections = []
-        for i, rows in enumerate(tables):
-            label = TABLE_LABELS[i] if i < len(TABLE_LABELS) else f"Bảng {i + 1}"
-            row_html = "\n".join(
-                f"<tr>"
-                f"<td style='padding:6px 12px;border-bottom:1px solid #eee'><strong>{escape(r['seller'])}</strong>"
-                f"{_region_span(r['region'])}</td>"
-                f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['buy'])}</td>"
-                f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['sell'])}</td>"
-                f"</tr>"
-                for r in rows
-            )
-            sections.append(f"""
-        <h2 style="color:#b8860b;font-size:16px;margin:20px 0 8px;">{escape(label)}</h2>
+def _table_html(rows, label_header):
+    row_html = "\n".join(
+        f"<tr>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'><strong>{escape(r['label'])}</strong>"
+        f"{_region_span(r['region'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['buy'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['sell'])}</td>"
+        f"</tr>"
+        for r in rows
+    )
+    return f"""
         <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
           <thead>
             <tr style="background:#f5f5f5;">
-              <th style="padding:8px 12px;text-align:left;">Đơn vị bán</th>
+              <th style="padding:8px 12px;text-align:left;">{escape(label_header)}</th>
               <th style="padding:8px 12px;text-align:right;">Mua vào</th>
               <th style="padding:8px 12px;text-align:right;">Bán ra</th>
             </tr>
@@ -280,15 +319,51 @@ def build_html(tables, source_url, timestamp):
           <tbody>
             {row_html}
           </tbody>
-        </table>""")
-        body = "\n".join(sections)
+        </table>"""
+
+
+def build_html(summary_tables, details, source_url, timestamp):
+    # --- Section 1: summary comparison ---
+    if not summary_tables:
+        summary_html = (
+            "<p>Could not parse the summary comparison table this run. "
+            f"Check <a href='{escape(source_url)}'>{escape(source_url)}</a> directly.</p>"
+        )
+    else:
+        parts = []
+        for i, rows in enumerate(summary_tables):
+            label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bảng {i + 1}"
+            parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:16px 0 6px;">{escape(label)}</h3>')
+            parts.append(_table_html(rows, "Đơn vị bán"))
+        summary_html = "\n".join(parts)
+
+    # --- Section 2: full detail per seller ---
+    detail_parts = []
+    for name, info in details.items():
+        detail_parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:20px 0 6px;">{escape(name)}</h3>')
+        if "error" in info:
+            detail_parts.append(
+                f"<p style='color:#a33;font-size:13px;'>Không lấy được dữ liệu chi tiết lần này "
+                f"({escape(info['error'])}). Xem trực tiếp tại "
+                f"<a href='{escape(info['url'])}'>{escape(info['url'])}</a>.</p>"
+            )
+            continue
+        for rows in info["tables"]:
+            detail_parts.append(_table_html(rows, "Loại vàng"))
+    detail_html = "\n".join(detail_parts) if detail_parts else "<p>Không có dữ liệu chi tiết.</p>"
 
     return f"""\
 <html>
   <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
     <h1 style="color:#b8860b;">Giá vàng hôm nay - các đơn vị lớn tại Việt Nam</h1>
     <p style="color:#555;">Cập nhật {escape(timestamp)}</p>
-    {body}
+
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;">Tổng hợp - So sánh giữa các đơn vị</h2>
+    {summary_html}
+
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;margin-top:28px;">Chi tiết đầy đủ theo từng đơn vị</h2>
+    {detail_html}
+
     <p style="color:#999; font-size:12px; margin-top:20px;">
       Nguồn: <a href="{escape(source_url)}">{escape(source_url)}</a> ·
       Đơn vị: nghìn đồng/lượng trừ khi ghi chú khác trên trang gốc ·
@@ -298,18 +373,31 @@ def build_html(tables, source_url, timestamp):
 </html>"""
 
 
-def build_plain_text(tables, source_url, timestamp):
-    lines = [f"Gia vang hom nay - cap nhat {timestamp}", ""]
-    if not tables:
-        lines.append("Could not parse any price rows this run.")
+def build_plain_text(summary_tables, details, source_url, timestamp):
+    lines = [f"Gia vang hom nay - cap nhat {timestamp}", "", "== TONG HOP =="]
+    if not summary_tables:
+        lines.append("Could not parse the summary comparison table this run.")
     else:
-        for i, rows in enumerate(tables):
-            label = TABLE_LABELS[i] if i < len(TABLE_LABELS) else f"Bang {i + 1}"
-            lines.append(f"== {label} ==")
+        for i, rows in enumerate(summary_tables):
+            label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bang {i + 1}"
+            lines.append(f"-- {label} --")
             for r in rows:
                 region_suffix = f" ({r['region']})" if r["region"] else ""
-                lines.append(f"{r['seller']}{region_suffix}: mua {r['buy']} / ban {r['sell']}")
+                lines.append(f"{r['label']}{region_suffix}: mua {r['buy']} / ban {r['sell']}")
             lines.append("")
+
+    lines.append("== CHI TIET THEO TUNG DON VI ==")
+    for name, info in details.items():
+        lines.append(f"-- {name} --")
+        if "error" in info:
+            lines.append(f"  Khong lay duoc du lieu ({info['error']}). Xem tai {info['url']}")
+            continue
+        for rows in info["tables"]:
+            for r in rows:
+                region_suffix = f" ({r['region']})" if r["region"] else ""
+                lines.append(f"  {r['label']}{region_suffix}: mua {r['buy']} / ban {r['sell']}")
+        lines.append("")
+
     lines.append(f"Nguon: {source_url}")
     return "\n".join(lines)
 
@@ -330,21 +418,27 @@ def cmd_generate():
             os.remove(os.path.join(EMAIL_DIR, f))
     os.makedirs(EMAIL_DIR, exist_ok=True)
 
-    print(f"Fetching {SOURCE_URL} ...")
+    print(f"Fetching summary page {SOURCE_URL} ...")
     try:
-        html = fetch_page()
+        summary_tables = fetch_summary()
     except requests.RequestException as e:
-        print(f"Failed to fetch page: {e}", file=sys.stderr)
+        print(f"Failed to fetch summary page: {e}", file=sys.stderr)
         sys.exit(1)
+    summary_rows = sum(len(rows) for rows in summary_tables)
+    print(f"Summary: parsed {len(summary_tables)} table(s), {summary_rows} row(s).")
 
-    tables = parse_gold_prices(html)
-    total_rows = sum(len(rows) for rows in tables)
-    print(f"Parsed {len(tables)} table(s), {total_rows} total price row(s).")
+    details = fetch_seller_details()
+    detail_rows = sum(len(t) for info in details.values() for t in info.get("tables", []))
+    failed = [name for name, info in details.items() if "error" in info]
+    print(f"Details: {len(details) - len(failed)}/{len(details)} sellers OK, {detail_rows} total row(s).")
+    if failed:
+        print(f"  Failed sellers this run: {', '.join(failed)}", file=sys.stderr)
 
-    price_hash = hash_tables(tables)
+    combined = {"summary": summary_tables, "details": details}
+    price_hash = hash_data(combined)
     last_hash = load_last_hash()
 
-    if tables and SEND_ONLY_ON_CHANGE and price_hash == last_hash:
+    if summary_tables and SEND_ONLY_ON_CHANGE and price_hash == last_hash:
         print("Prices unchanged since last run and SEND_ONLY_ON_CHANGE=true - skipping email.")
         with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
             json.dump({"send": False}, f)
@@ -352,8 +446,8 @@ def cmd_generate():
 
     now, timestamp = resolve_timestamp()
     subject = f"Gia vang hom nay - {now.strftime('%d/%m/%Y %H:%M')}"
-    html_body = build_html(tables, SOURCE_URL, timestamp)
-    text_body = build_plain_text(tables, SOURCE_URL, timestamp)
+    html_body = build_html(summary_tables, details, SOURCE_URL, timestamp)
+    text_body = build_plain_text(summary_tables, details, SOURCE_URL, timestamp)
 
     with open(os.path.join(EMAIL_DIR, "subject.txt"), "w") as f:
         f.write(subject)
@@ -362,12 +456,15 @@ def cmd_generate():
     with open(os.path.join(EMAIL_DIR, "body.txt"), "w") as f:
         f.write(text_body)
     with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
-        json.dump({"send": True, "table_count": len(tables), "row_count": total_rows}, f)
+        json.dump(
+            {"send": True, "summary_rows": summary_rows, "detail_rows": detail_rows, "failed_sellers": failed},
+            f,
+        )
 
     # Only persist the new hash once the email has actually been composed,
     # mirroring the meme bot's "mark as sent only after it's queued" logic.
     save_last_hash(price_hash)
-    print(f"Generated email with {total_rows} row(s) across {len(tables)} table(s). Saved to ./{EMAIL_DIR}/")
+    print(f"Generated email ({summary_rows} summary rows, {detail_rows} detail rows). Saved to ./{EMAIL_DIR}/")
 
 
 def cmd_send():
