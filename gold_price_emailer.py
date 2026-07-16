@@ -23,20 +23,28 @@ pages are server-rendered (unlike most individual sellers' own sites, e.g.
 SJC/DOJI/PNJ/Mi Hong, which load their price tables via JavaScript and
 can't be read by a plain HTTP scraper).
 
-The email has two sections:
-  1. Summary - the homepage's comparison table (one row per seller, for
-     gold bars and for gold rings), covering SJC, DOJI, PNJ, Bao Tin Minh
-     Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and Ngoc Tham.
-  2. Full detail per seller - each seller also has its own page on
+The email has four sections:
+  1. Gold summary - the homepage's comparison table (one row per seller,
+     for gold bars and for gold rings), covering SJC, DOJI, PNJ, Bao Tin
+     Minh Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and Ngoc Tham.
+  2. Gold full detail per seller - each seller also has its own page on
      giavang.org (e.g. giavang.org/trong-nuoc/sjc/) with a full product
      breakdown (gold bars in different weights, rings, various jewelry
      purities, etc). This script fetches all 8 of those pages too and
      includes each seller's full table as its own section, the same shape
      baotinmanhhai.vn's own page used to provide for just that one seller.
+  3. Silver summary - a comparison table from giahanghoa.net across the
+     major silver sellers/products.
+  4. Silver full detail per seller - a fuller product breakdown per silver
+     brand, for brands that have their own dedicated price page (currently
+     Phu Quy and ANCARAT). Brands without one fall back to their row(s)
+     from the summary table instead of being dropped.
 
-That's 1 (summary) + 8 (per-seller detail) = 9 requests to giavang.org per
-run. If a single seller's detail page fails to fetch/parse, that one
-section notes the failure and the rest of the email still sends normally.
+That's 1 (gold summary) + 8 (gold per-seller detail) + 1 (silver summary)
++ 2 (silver per-brand detail) = 12 requests per run. If a single page
+fails to fetch/parse, only that section (or that one brand's row, for
+silver detail) notes the issue and the rest of the email still sends
+normally.
 
 Unlike the meme bot (which dedups by post ID so it never re-sends the same
 meme), there's no natural "ID" for a price snapshot. Instead this dedups by
@@ -61,7 +69,8 @@ SETUP
        export GOLD_RECIPIENT="where-to-send@example.com"
        export SEND_ONLY_ON_CHANGE="false"          # optional, default false
        export TIMEZONE="Asia/Ho_Chi_Minh"          # optional, for the subject line
-       export SOURCE_URL="https://giavang.org/"    # optional, summary page
+       export SOURCE_URL="https://giavang.org/"    # optional, gold summary page
+       export SILVER_URL="https://giahanghoa.net/gia-bac"  # optional, silver summary page
        export STATE_FILE="state/last_price.json"   # optional, dedup state file
        export ALLOW_INSECURE_SSL_FALLBACK="false"  # optional, last-resort TLS bypass
 
@@ -72,9 +81,9 @@ schedule in the cloud without needing your own computer on.
 
 NOTE ON SCRAPING
 -----------------
-Always worth checking the current robots.txt / terms of whatever site this
-is pointed at before running it unattended long-term, e.g.:
-    https://giavang.org/robots.txt
+Always worth checking the current robots.txt / terms of whatever sites
+this is pointed at before running it unattended long-term, e.g.:
+    https://giavang.org/robots.txt , https://giahanghoa.net/robots.txt
 The page markup can also change at any time — if `generate` reports 0
 parsed rows for a section, open the relevant page, inspect the price
 table, and update the parsing functions below.
