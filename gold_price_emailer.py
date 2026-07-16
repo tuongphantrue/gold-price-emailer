@@ -108,6 +108,18 @@ SOURCE_URL = os.environ.get("SOURCE_URL", "https://giavang.org/")
 DETAIL_BASE_URL = "https://giavang.org/trong-nuoc/"
 SILVER_URL = os.environ.get("SILVER_URL", "https://giahanghoa.net/gia-bac")
 
+# Some silver brands have their own dedicated, server-rendered price page
+# with a much fuller product breakdown than the giahanghoa.net comparison
+# table gives. Where we have one, fetch_silver_details prefers it; brands
+# not listed here (or whose page fails/returns nothing) fall back to that
+# brand's own row(s) already present in the summary table instead of being
+# dropped. (DOJI has a giabac.doji.vn page too, but it loads prices via
+# JavaScript - "Đang tải..." with no static data - so it's not usable here.)
+SILVER_DETAIL_PAGES = {
+    "Phú Quý": "https://giabac.phuquygroup.vn/",
+    "ANCARAT": "https://giabac.ancarat.com/",
+}
+
 # Used to split giahanghoa.net's combined "Brand ProductName" cell back into
 # its two parts (see _split_brand_product). Longest names first, so e.g.
 # "Bảo Tín Minh Châu" matches before a shorter unrelated prefix could.
@@ -327,6 +339,73 @@ def fetch_silver():
         return {"error": str(e), "url": SILVER_URL}
 
 
+def parse_generic_price_table(html):
+    """
+    Generic parser for simple "product name + price columns" tables (no
+    region rowspan) - used for brands' own dedicated silver pages like
+    Phu Quy's and Ancarat's. Detects the buy/sell column indices from the
+    header row by matching common header labels instead of assuming a
+    fixed position, since column order/count (e.g. an extra unit column,
+    or "Bán ra" listed before "Mua vào") differs by site. Rows that are
+    really section-header dividers (e.g. "NHÓM BẠC TÍCH TRỮ...") get
+    skipped automatically since their price cells are empty.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    buy_labels = {"mua vào", "giá mua vào"}
+    sell_labels = {"bán ra", "giá bán ra"}
+    for table in soup.find_all("table"):
+        header_row = table.find("tr")
+        if not header_row:
+            continue
+        header_cells = [c.get_text(strip=True).lower() for c in header_row.find_all(["td", "th"])]
+        buy_idx = next((i for i, h in enumerate(header_cells) if h in buy_labels), None)
+        sell_idx = next((i for i, h in enumerate(header_cells) if h in sell_labels), None)
+        if buy_idx is None or sell_idx is None:
+            continue
+        rows_out = []
+        for tr in table.find_all("tr")[1:]:
+            cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+            if not cells or all(not c for c in cells):
+                continue
+            if len(cells) <= max(buy_idx, sell_idx):
+                continue
+            product, buy, sell = cells[0], cells[buy_idx], cells[sell_idx]
+            if not product or not _looks_like_price(buy):
+                continue  # section-header row or malformed row
+            rows_out.append({"product": product, "buy": buy, "sell": sell})
+        if rows_out:
+            return rows_out
+    return []
+
+
+def fetch_silver_details(summary_rows):
+    """
+    Build a full per-brand silver detail section. Brands with a known
+    dedicated page (SILVER_DETAIL_PAGES) get the fuller breakdown from
+    that page; everyone else falls back to their own row(s) already
+    present in the summary comparison table, so no brand is dropped even
+    without a dedicated page.
+    """
+    by_brand = {}
+    for r in summary_rows:  # preserves first-seen order from the summary table
+        by_brand.setdefault(r["brand"], []).append({"product": r["product"], "buy": r["buy"], "sell": r["sell"]})
+
+    details = {}
+    for brand, fallback_products in by_brand.items():
+        url = SILVER_DETAIL_PAGES.get(brand)
+        if not url:
+            details[brand] = {"products": fallback_products, "source": None}
+            continue
+        try:
+            html = fetch_page(url)
+            products = parse_generic_price_table(html)
+            details[brand] = {"products": products or fallback_products, "source": url}
+        except requests.RequestException as e:
+            print(f"  Failed to fetch {brand}'s silver detail page: {e}", file=sys.stderr)
+            details[brand] = {"products": fallback_products, "source": None}
+    return details
+
+
 def fetch_summary():
     """Fetch + parse the homepage comparison tables (one row per seller)."""
     html = fetch_page(SOURCE_URL)
@@ -415,7 +494,31 @@ def _silver_table_html(rows):
         </table>"""
 
 
-def build_html(summary_tables, details, silver, source_url, timestamp):
+def _silver_detail_table_html(products):
+    row_html = "\n".join(
+        f"<tr>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(p['product'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(p['buy'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(p['sell'])}</td>"
+        f"</tr>"
+        for p in products
+    )
+    return f"""
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
+          <thead>
+            <tr style="background:#f5f5f5;">
+              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
+              <th style="padding:8px 12px;text-align:right;">Mua vào</th>
+              <th style="padding:8px 12px;text-align:right;">Bán ra</th>
+            </tr>
+          </thead>
+          <tbody>
+            {row_html}
+          </tbody>
+        </table>"""
+
+
+def build_html(summary_tables, details, silver, silver_details, source_url, timestamp):
     # --- Section 1: summary comparison ---
     if not summary_tables:
         summary_html = (
@@ -455,6 +558,17 @@ def build_html(summary_tables, details, silver, source_url, timestamp):
     else:
         silver_html = _silver_table_html(silver["rows"])
 
+    silver_detail_parts = []
+    for brand, info in silver_details.items():
+        silver_detail_parts.append(f'<h3 style="color:#666;font-size:15px;margin:20px 0 6px;">{escape(brand)}</h3>')
+        if not info["source"]:
+            silver_detail_parts.append(
+                "<p style='color:#999;font-size:12px;margin:0 0 6px;'>"
+                "(Không có trang chi tiết riêng cho đơn vị này - hiển thị dữ liệu từ bảng tổng hợp.)</p>"
+            )
+        silver_detail_parts.append(_silver_detail_table_html(info["products"]))
+    silver_detail_html = "\n".join(silver_detail_parts) if silver_detail_parts else "<p>Không có dữ liệu chi tiết.</p>"
+
     return f"""\
 <html>
   <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
@@ -470,6 +584,9 @@ def build_html(summary_tables, details, silver, source_url, timestamp):
     <h2 style="color:#333;font-size:18px;border-bottom:2px solid #888;padding-bottom:4px;margin-top:28px;">Bạc - So sánh giữa các đơn vị</h2>
     {silver_html}
 
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #888;padding-bottom:4px;margin-top:28px;">Bạc - Chi tiết đầy đủ theo từng đơn vị</h2>
+    {silver_detail_html}
+
     <p style="color:#999; font-size:12px; margin-top:20px;">
       Nguồn: <a href="{escape(source_url)}">{escape(source_url)}</a> (vàng),
       <a href="{escape(SILVER_URL)}">{escape(SILVER_URL)}</a> (bạc) ·
@@ -480,7 +597,7 @@ def build_html(summary_tables, details, silver, source_url, timestamp):
 </html>"""
 
 
-def build_plain_text(summary_tables, details, silver, source_url, timestamp):
+def build_plain_text(summary_tables, details, silver, silver_details, source_url, timestamp):
     lines = [f"Gia vang & bac hom nay - cap nhat {timestamp}", "", "== VANG - TONG HOP =="]
     if not summary_tables:
         lines.append("Could not parse the summary comparison table this run.")
@@ -512,6 +629,15 @@ def build_plain_text(summary_tables, details, silver, source_url, timestamp):
         for r in silver["rows"]:
             lines.append(f"  {r['brand']} - {r['product']}: mua {r['buy']} / ban {r['sell']}")
     lines.append("")
+
+    lines.append("== BAC - CHI TIET DAY DU THEO TUNG DON VI ==")
+    for brand, info in silver_details.items():
+        lines.append(f"-- {brand} --")
+        if not info["source"]:
+            lines.append("  (khong co trang chi tiet rieng - du lieu tu bang tong hop)")
+        for p in info["products"]:
+            lines.append(f"  {p['product']}: mua {p['buy']} / ban {p['sell']}")
+        lines.append("")
 
     lines.append(f"Nguon vang: {source_url}")
     lines.append(f"Nguon bac: {SILVER_URL}")
@@ -555,7 +681,12 @@ def cmd_generate():
     silver_rows = len(silver.get("rows", []))
     print(f"Silver: {silver_rows} row(s)." if "rows" in silver else f"Silver: failed ({silver['error']}).")
 
-    combined = {"summary": summary_tables, "details": details, "silver": silver}
+    silver_details = fetch_silver_details(silver.get("rows", []))
+    silver_detail_count = sum(len(info["products"]) for info in silver_details.values())
+    dedicated_ok = [b for b, info in silver_details.items() if info["source"]]
+    print(f"Silver detail: {len(dedicated_ok)}/{len(silver_details)} brand(s) via dedicated page, {silver_detail_count} total product row(s).")
+
+    combined = {"summary": summary_tables, "details": details, "silver": silver, "silver_details": silver_details}
     price_hash = hash_data(combined)
     last_hash = load_last_hash()
 
@@ -567,8 +698,8 @@ def cmd_generate():
 
     now, timestamp = resolve_timestamp()
     subject = f"Gia vang & bac hom nay - {now.strftime('%d/%m/%Y %H:%M')}"
-    html_body = build_html(summary_tables, details, silver, SOURCE_URL, timestamp)
-    text_body = build_plain_text(summary_tables, details, silver, SOURCE_URL, timestamp)
+    html_body = build_html(summary_tables, details, silver, silver_details, SOURCE_URL, timestamp)
+    text_body = build_plain_text(summary_tables, details, silver, silver_details, SOURCE_URL, timestamp)
 
     with open(os.path.join(EMAIL_DIR, "subject.txt"), "w") as f:
         f.write(subject)
@@ -585,6 +716,7 @@ def cmd_generate():
                 "failed_sellers": failed,
                 "silver_rows": silver_rows,
                 "silver_ok": "rows" in silver,
+                "silver_detail_rows": silver_detail_count,
             },
             f,
         )
@@ -594,7 +726,7 @@ def cmd_generate():
     save_last_hash(price_hash)
     print(
         f"Generated email ({summary_rows} summary rows, {detail_rows} detail rows, "
-        f"{silver_rows} silver rows). Saved to ./{EMAIL_DIR}/"
+        f"{silver_rows} silver rows, {silver_detail_count} silver detail rows). Saved to ./{EMAIL_DIR}/"
     )
 
 
