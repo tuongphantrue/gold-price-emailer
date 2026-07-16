@@ -23,7 +23,7 @@ pages are server-rendered (unlike most individual sellers' own sites, e.g.
 SJC/DOJI/PNJ/Mi Hong, which load their price tables via JavaScript and
 can't be read by a plain HTTP scraper).
 
-The email has four sections:
+The email has five sections:
   1. Gold summary - the homepage's comparison table (one row per seller,
      for gold bars and for gold rings), covering SJC, DOJI, PNJ, Bao Tin
      Minh Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and Ngoc Tham.
@@ -39,12 +39,13 @@ The email has four sections:
      brand, for brands that have their own dedicated price page (currently
      Phu Quy and ANCARAT). Brands without one fall back to their row(s)
      from the summary table instead of being dropped.
-
-That's 1 (gold summary) + 8 (gold per-seller detail) + 1 (silver summary)
-+ 2 (silver per-brand detail) = 12 requests per run. If a single page
-fails to fetch/parse, only that section (or that one brand's row, for
-silver detail) notes the issue and the rest of the email still sends
-normally.
+  5. Price changes - how today's sell price compares to ~7/30/365 days
+     ago, per gold-summary row and per silver-summary row. This is
+     computed from a self-recorded daily snapshot history (state/
+     price_history.json, persisted the same way as the dedup hash) since
+     no source site gives clean scrapeable historical data for all these
+     sellers - so the 30-day/1-year columns start out as "not enough data
+     yet" and fill in as the workflow keeps running over time.
 
 Unlike the meme bot (which dedups by post ID so it never re-sends the same
 meme), there's no natural "ID" for a price snapshot. Instead this dedups by
@@ -72,6 +73,7 @@ SETUP
        export SOURCE_URL="https://giavang.org/"    # optional, gold summary page
        export SILVER_URL="https://giahanghoa.net/gia-bac"  # optional, silver summary page
        export STATE_FILE="state/last_price.json"   # optional, dedup state file
+       export PRICE_HISTORY_FILE="state/price_history.json"  # optional, daily snapshot history
        export ALLOW_INSECURE_SSL_FALLBACK="false"  # optional, last-resort TLS bypass
 
 SCHEDULING
@@ -173,6 +175,22 @@ EMAIL_DIR = "email"
 STATE_FILE = os.environ.get("STATE_FILE", "state/last_price.json")
 SEND_ONLY_ON_CHANGE = os.environ.get("SEND_ONLY_ON_CHANGE", "false").lower() == "true"
 
+# A second state file (also persisted on the gold-price-state branch,
+# alongside STATE_FILE) holding one price snapshot per calendar day. Used
+# to compute the "Biến động giá" (price changes) section - how today's
+# sell price compares to ~7/30/365 days ago. Re-running within the same
+# day overwrites that day's entry rather than adding a new one, so this
+# grows by about 1 entry/day regardless of how often the workflow runs.
+# Entries older than HISTORY_MAX_DAYS are pruned on save to bound growth.
+PRICE_HISTORY_FILE = os.environ.get("PRICE_HISTORY_FILE", "state/price_history.json")
+HISTORY_MAX_DAYS = 400
+# (display label, days ago) - the periods shown in the changes section.
+HISTORY_PERIODS = [("7 ngày", 7), ("30 ngày", 30), ("1 năm", 365)]
+# A historical snapshot is treated as "the Nth-day-ago price" if it falls
+# within this many days of the exact target date - since the workflow
+# only takes one snapshot per calendar day, there's rarely an exact match.
+HISTORY_MATCH_TOLERANCE_DAYS = 3
+
 # Labels for each table on the summary page, in the order they appear.
 SUMMARY_TABLE_LABELS = ["Vàng Miếng (gold bars)", "Vàng Nhẫn 1 Chỉ (gold rings)"]
 
@@ -202,6 +220,140 @@ def save_last_hash(price_hash, path=STATE_FILE):
 def hash_data(data):
     canonical = json.dumps(data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _parse_vnd_number(s):
+    """'148.400.000' / '2,199,000' -> 148400000 - strips whatever
+    separator style the source site uses and keeps only the digits.
+    Returns None if there are no digits (e.g. a blank/"-" price cell).
+    """
+    digits = re.sub(r"[^\d]", "", s or "")
+    return int(digits) if digits else None
+
+
+def build_today_snapshot(summary_tables, silver):
+    """
+    Build today's price snapshot for history tracking: sell ("Bán ra")
+    price per gold-summary row and per silver-summary row, keyed by
+    label so it can be compared against past snapshots later. Scoped to
+    the summary-level data (not the full per-seller detail breakdown) to
+    keep the history file small and the changes section readable.
+    """
+    gold = {}
+    for i, rows in enumerate(summary_tables):
+        table_key = f"table_{i}"
+        gold[table_key] = {}
+        for r in rows:
+            sell = _parse_vnd_number(r["sell"])
+            if sell is not None:
+                gold[table_key][r["label"]] = sell
+
+    silver_snap = {}
+    if "rows" in silver:
+        for r in silver["rows"]:
+            sell = _parse_vnd_number(r["sell"])
+            if sell is not None:
+                silver_snap[f"{r['brand']} - {r['product']}"] = sell
+
+    return {"gold": gold, "silver": silver_snap}
+
+
+def load_history(path=PRICE_HISTORY_FILE):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  could not read {path} ({e}) — starting with empty price history", file=sys.stderr)
+        return {}
+
+
+def save_history(history, today_str, today_snapshot, path=PRICE_HISTORY_FILE):
+    history = dict(history)
+    history[today_str] = today_snapshot
+    cutoff = (datetime.strptime(today_str, "%Y-%m-%d") - _timedelta(days=HISTORY_MAX_DAYS)).strftime("%Y-%m-%d")
+    history = {d: snap for d, snap in history.items() if d >= cutoff}
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(history, f, ensure_ascii=False)
+    return history
+
+
+def _timedelta(days):
+    from datetime import timedelta
+    return timedelta(days=days)
+
+
+def _closest_snapshot_for_period(history, today_str, days_ago):
+    """Find the history entry closest to `days_ago` days before today,
+    within HISTORY_MATCH_TOLERANCE_DAYS. Returns (date_str, snapshot) or
+    (None, None) if nothing in range (e.g. not enough history yet).
+    """
+    today = datetime.strptime(today_str, "%Y-%m-%d")
+    target = today - _timedelta(days=days_ago)
+    best_date, best_snapshot, best_diff = None, None, None
+    for date_str, snapshot in history.items():
+        if date_str == today_str:
+            continue
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            continue
+        diff = abs((d - target).days)
+        if diff <= HISTORY_MATCH_TOLERANCE_DAYS and (best_diff is None or diff < best_diff):
+            best_date, best_snapshot, best_diff = date_str, snapshot, diff
+    return best_date, best_snapshot
+
+
+def compute_price_changes(history, today_str, today_snapshot):
+    """
+    Build the data for the "Biến động giá" section: for each gold-summary
+    table and for silver, for each item, look up its sell price at each
+    HISTORY_PERIODS point and compute the diff/percent change. Items or
+    periods without a close-enough historical snapshot are marked
+    unavailable rather than guessed at.
+    """
+    period_snapshots = {
+        label: _closest_snapshot_for_period(history, today_str, days)[1] for label, days in HISTORY_PERIODS
+    }
+
+    def changes_for(current_sell, hist_key_path):
+        """hist_key_path is a function(snapshot) -> value-or-None, so this
+        works for both gold (snapshot['gold'][table_key][label]) and
+        silver (snapshot['silver'][key]) lookups."""
+        out = {}
+        for label, _days in HISTORY_PERIODS:
+            snap = period_snapshots[label]
+            hist_value = hist_key_path(snap) if snap else None
+            if hist_value is None or current_sell is None:
+                out[label] = None
+                continue
+            diff = current_sell - hist_value
+            pct = (diff / hist_value * 100) if hist_value else None
+            out[label] = {"diff": diff, "pct": pct}
+        return out
+
+    gold_changes = []
+    for table_key, items in today_snapshot["gold"].items():
+        rows = []
+        for label, current_sell in items.items():
+            rows.append({
+                "label": label,
+                "current_sell": current_sell,
+                "changes": changes_for(current_sell, lambda snap, tk=table_key, lb=label: snap.get("gold", {}).get(tk, {}).get(lb)),
+            })
+        gold_changes.append(rows)
+
+    silver_changes = []
+    for key, current_sell in today_snapshot["silver"].items():
+        silver_changes.append({
+            "label": key,
+            "current_sell": current_sell,
+            "changes": changes_for(current_sell, lambda snap, k=key: snap.get("silver", {}).get(k)),
+        })
+
+    return {"gold": gold_changes, "silver": silver_changes}
 
 
 def fetch_page(url):
@@ -527,7 +679,53 @@ def _silver_detail_table_html(products):
         </table>"""
 
 
-def build_html(summary_tables, details, silver, silver_details, source_url, timestamp):
+def _format_vnd(n):
+    """148400000 -> '148.400.000' (Vietnamese thousands separator)."""
+    return f"{n:,.0f}".replace(",", ".")
+
+
+def _format_diff(change):
+    if not change:
+        return "Chưa đủ dữ liệu"
+    diff, pct = change["diff"], change["pct"]
+    sign = "+" if diff >= 0 else ""
+    pct_str = f" ({sign}{pct:.2f}%)" if pct is not None else ""
+    color = "#1a7a1a" if diff > 0 else ("#a33" if diff < 0 else "#666")
+    return f"<span style='color:{color}'>{sign}{_format_vnd(diff)}{pct_str}</span>"
+
+
+def _changes_table_html(rows):
+    period_headers = "".join(
+        f"<th style='padding:8px 12px;text-align:right;'>{escape(label)}</th>" for label, _ in HISTORY_PERIODS
+    )
+    row_html = "\n".join(
+        "<tr>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(r['label'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{_format_vnd(r['current_sell'])}</td>"
+        + "".join(
+            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-size:12px'>"
+            f"{_format_diff(r['changes'][label])}</td>"
+            for label, _ in HISTORY_PERIODS
+        )
+        + "</tr>"
+        for r in rows
+    )
+    return f"""
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:700px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
+          <thead>
+            <tr style="background:#f5f5f5;">
+              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
+              <th style="padding:8px 12px;text-align:right;">Bán ra hiện tại</th>
+              {period_headers}
+            </tr>
+          </thead>
+          <tbody>
+            {row_html}
+          </tbody>
+        </table>"""
+
+
+def build_html(summary_tables, details, silver, silver_details, price_changes, source_url, timestamp):
     # --- Section 1: summary comparison ---
     if not summary_tables:
         summary_html = (
@@ -578,6 +776,19 @@ def build_html(summary_tables, details, silver, silver_details, source_url, time
         silver_detail_parts.append(_silver_detail_table_html(info["products"]))
     silver_detail_html = "\n".join(silver_detail_parts) if silver_detail_parts else "<p>Không có dữ liệu chi tiết.</p>"
 
+    # --- Section 5: price changes over time ---
+    changes_parts = []
+    for i, rows in enumerate(price_changes["gold"]):
+        if not rows:
+            continue
+        label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bảng {i + 1}"
+        changes_parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:16px 0 6px;">{escape(label)}</h3>')
+        changes_parts.append(_changes_table_html(rows))
+    if price_changes["silver"]:
+        changes_parts.append('<h3 style="color:#666;font-size:15px;margin:20px 0 6px;">Bạc</h3>')
+        changes_parts.append(_changes_table_html(price_changes["silver"]))
+    changes_html = "\n".join(changes_parts) if changes_parts else "<p>Không có dữ liệu để so sánh.</p>"
+
     return f"""\
 <html>
   <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
@@ -596,6 +807,10 @@ def build_html(summary_tables, details, silver, silver_details, source_url, time
     <h2 style="color:#333;font-size:18px;border-bottom:2px solid #888;padding-bottom:4px;margin-top:28px;">Bạc - Chi tiết đầy đủ theo từng đơn vị</h2>
     {silver_detail_html}
 
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #555;padding-bottom:4px;margin-top:28px;">Biến động giá (so với 7 ngày / 30 ngày / 1 năm trước)</h2>
+    {changes_html}
+    <p style="color:#999;font-size:12px;margin-top:4px;">Biến động dựa trên lịch sử tự ghi nhận từ lần đầu email này chạy - có thể chưa đủ dữ liệu cho mốc 30 ngày/1 năm ngay từ đầu, sẽ đầy đủ dần theo thời gian.</p>
+
     <p style="color:#999; font-size:12px; margin-top:20px;">
       Nguồn: <a href="{escape(source_url)}">{escape(source_url)}</a> (vàng),
       <a href="{escape(SILVER_URL)}">{escape(SILVER_URL)}</a> (bạc) ·
@@ -606,7 +821,7 @@ def build_html(summary_tables, details, silver, silver_details, source_url, time
 </html>"""
 
 
-def build_plain_text(summary_tables, details, silver, silver_details, source_url, timestamp):
+def build_plain_text(summary_tables, details, silver, silver_details, price_changes, source_url, timestamp):
     lines = [f"Gia vang & bac hom nay - cap nhat {timestamp}", "", "== VANG - TONG HOP =="]
     if not summary_tables:
         lines.append("Could not parse the summary comparison table this run.")
@@ -650,6 +865,34 @@ def build_plain_text(summary_tables, details, silver, silver_details, source_url
 
     lines.append(f"Nguon vang: {source_url}")
     lines.append(f"Nguon bac: {SILVER_URL}")
+
+    def _fmt_change_line(label, current_sell, changes):
+        parts = [f"{label}: ban ra {current_sell:,}".replace(",", ".")]
+        for period_label, _days in HISTORY_PERIODS:
+            c = changes[period_label]
+            if not c:
+                parts.append(f"{period_label}: chua du du lieu")
+            else:
+                sign = "+" if c["diff"] >= 0 else ""
+                pct = f" ({sign}{c['pct']:.2f}%)" if c["pct"] is not None else ""
+                parts.append(f"{period_label}: {sign}{c['diff']:,}".replace(",", ".") + pct)
+        return " | ".join(parts)
+
+    lines.append("")
+    lines.append("== BIEN DONG GIA (so voi 7 ngay / 30 ngay / 1 nam truoc) ==")
+    for i, rows in enumerate(price_changes["gold"]):
+        if not rows:
+            continue
+        label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bang {i + 1}"
+        lines.append(f"-- {label} --")
+        for r in rows:
+            lines.append("  " + _fmt_change_line(r["label"], r["current_sell"], r["changes"]))
+        lines.append("")
+    if price_changes["silver"]:
+        lines.append("-- Bac --")
+        for r in price_changes["silver"]:
+            lines.append("  " + _fmt_change_line(r["label"], r["current_sell"], r["changes"]))
+
     return "\n".join(lines)
 
 
@@ -695,7 +938,26 @@ def cmd_generate():
     dedicated_ok = [b for b, info in silver_details.items() if info["source"]]
     print(f"Silver detail: {len(dedicated_ok)}/{len(silver_details)} brand(s) via dedicated page, {silver_detail_count} total product row(s).")
 
-    combined = {"summary": summary_tables, "details": details, "silver": silver, "silver_details": silver_details}
+    now, timestamp = resolve_timestamp()
+    today_str = now.strftime("%Y-%m-%d")
+
+    # Record today's snapshot and compute changes against *prior* history
+    # (i.e. compute first, then save - otherwise today would count as its
+    # own "history" and every diff would show zero).
+    today_snapshot = build_today_snapshot(summary_tables, silver)
+    history = load_history()
+    price_changes = compute_price_changes(history, today_str, today_snapshot)
+    history = save_history(history, today_str, today_snapshot)
+    changes_count = sum(len(rows) for rows in price_changes["gold"]) + len(price_changes["silver"])
+    print(f"Price changes: computed for {changes_count} item(s) against {len(history)} day(s) of history.")
+
+    combined = {
+        "summary": summary_tables,
+        "details": details,
+        "silver": silver,
+        "silver_details": silver_details,
+        "price_changes": price_changes,
+    }
     price_hash = hash_data(combined)
     last_hash = load_last_hash()
 
@@ -705,10 +967,9 @@ def cmd_generate():
             json.dump({"send": False}, f)
         return
 
-    now, timestamp = resolve_timestamp()
     subject = f"Gia vang & bac hom nay - {now.strftime('%d/%m/%Y %H:%M')}"
-    html_body = build_html(summary_tables, details, silver, silver_details, SOURCE_URL, timestamp)
-    text_body = build_plain_text(summary_tables, details, silver, silver_details, SOURCE_URL, timestamp)
+    html_body = build_html(summary_tables, details, silver, silver_details, price_changes, SOURCE_URL, timestamp)
+    text_body = build_plain_text(summary_tables, details, silver, silver_details, price_changes, SOURCE_URL, timestamp)
 
     with open(os.path.join(EMAIL_DIR, "subject.txt"), "w") as f:
         f.write(subject)
@@ -726,6 +987,7 @@ def cmd_generate():
                 "silver_rows": silver_rows,
                 "silver_ok": "rows" in silver,
                 "silver_detail_rows": silver_detail_count,
+                "changes_count": changes_count,
             },
             f,
         )
@@ -735,7 +997,8 @@ def cmd_generate():
     save_last_hash(price_hash)
     print(
         f"Generated email ({summary_rows} summary rows, {detail_rows} detail rows, "
-        f"{silver_rows} silver rows, {silver_detail_count} silver detail rows). Saved to ./{EMAIL_DIR}/"
+        f"{silver_rows} silver rows, {silver_detail_count} silver detail rows, "
+        f"{changes_count} change rows). Saved to ./{EMAIL_DIR}/"
     )
 
 
