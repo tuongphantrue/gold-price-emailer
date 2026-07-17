@@ -23,29 +23,13 @@ pages are server-rendered (unlike most individual sellers' own sites, e.g.
 SJC/DOJI/PNJ/Mi Hong, which load their price tables via JavaScript and
 can't be read by a plain HTTP scraper).
 
-The email has five sections:
-  1. Gold summary - the homepage's comparison table (one row per seller,
-     for gold bars and for gold rings), covering SJC, DOJI, PNJ, Bao Tin
-     Minh Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and Ngoc Tham.
-  2. Gold full detail per seller - each seller also has its own page on
-     giavang.org (e.g. giavang.org/trong-nuoc/sjc/) with a full product
-     breakdown (gold bars in different weights, rings, various jewelry
-     purities, etc). This script fetches all 8 of those pages too and
-     includes each seller's full table as its own section, the same shape
-     baotinmanhhai.vn's own page used to provide for just that one seller.
-  3. Silver summary - a comparison table from giahanghoa.net across the
-     major silver sellers/products.
-  4. Silver full detail per seller - a fuller product breakdown per silver
-     brand, for brands that have their own dedicated price page (currently
-     Phu Quy and ANCARAT). Brands without one fall back to their row(s)
-     from the summary table instead of being dropped.
-  5. Price changes - how today's sell price compares to ~7/30/365 days
-     ago, per gold-summary row and per silver-summary row. This is
-     computed from a self-recorded daily snapshot history (state/
-     price_history.json, persisted the same way as the dedup hash) since
-     no source site gives clean scrapeable historical data for all these
-     sellers - so the 30-day/1-year columns start out as "not enough data
-     yet" and fill in as the workflow keeps running over time.
+The email has five sections: gold summary, gold full detail per seller,
+silver summary, silver full detail per seller, and price changes over
+time (7/30/365 days, computed from a self-recorded daily snapshot since
+no robots-compliant source publishes clean historical data for all these
+sellers - silver additionally gets an immediate "today" fallback from
+giahanghoa.net's own reported 24h change, available from day one before
+the self-tracked history has accumulated enough days).
 
 Unlike the meme bot (which dedups by post ID so it never re-sends the same
 meme), there's no natural "ID" for a price snapshot. Instead this dedups by
@@ -306,14 +290,23 @@ def _closest_snapshot_for_period(history, today_str, days_ago):
     return best_date, best_snapshot
 
 
-def compute_price_changes(history, today_str, today_snapshot):
+def compute_price_changes(history, today_str, today_snapshot, silver_source_changes=None):
     """
     Build the data for the "Biến động giá" section: for each gold-summary
     table and for silver, for each item, look up its sell price at each
     HISTORY_PERIODS point and compute the diff/percent change. Items or
     periods without a close-enough historical snapshot are marked
     unavailable rather than guessed at.
+
+    silver_source_changes (optional): {"brand - product": "+4.000"} - the
+    source site's own reported today-vs-yesterday change (see
+    parse_silver_table), attached to each silver row as "source_today" so
+    it's available immediately even on day one, before price_history.json
+    has accumulated enough days for the 7-day/30-day/1-year columns. No
+    equivalent exists for gold on any robots-compliant source we use, so
+    gold rows don't get this field.
     """
+    silver_source_changes = silver_source_changes or {}
     period_snapshots = {
         label: _closest_snapshot_for_period(history, today_str, days)[1] for label, days in HISTORY_PERIODS
     }
@@ -351,6 +344,7 @@ def compute_price_changes(history, today_str, today_snapshot):
             "label": key,
             "current_sell": current_sell,
             "changes": changes_for(current_sell, lambda snap, k=key: snap.get("silver", {}).get(k)),
+            "source_today": silver_source_changes.get(key),
         })
 
     return {"gold": gold_changes, "silver": silver_changes}
@@ -450,10 +444,19 @@ def _looks_like_price(s):
 def parse_silver_table(html):
     """
     Parse giahanghoa.net's silver comparison table into a list of
-    {brand, product, buy, sell} rows. That table's first column combines
-    brand and product name in one cell (e.g. "Phú Quý BẠC MIẾNG PHÚ QUÝ
-    999 1 LƯỢNG"), so _split_brand_product pulls them back apart using a
-    known-brand-name match.
+    {brand, product, buy, sell, change_24h} rows. That table's first
+    column combines brand and product name in one cell (e.g. "Phú Quý
+    BẠC MIẾNG PHÚ QUÝ 999 1 LƯỢNG"), so _split_brand_product pulls them
+    back apart using a known-brand-name match.
+
+    change_24h (if present) is the site's own reported today-vs-yesterday
+    change, e.g. "+4.000" - used as an immediate fallback in the changes
+    section for the "today" column, since our self-tracked
+    price_history.json needs to accumulate at least a day before it can
+    report anything, whereas the source already publishes this every run.
+    No equivalent same-day (or 7-day/30-day/1-year) column exists on any
+    robots-compliant source we use for gold, so gold's changes section
+    stays purely history-based.
     """
     soup = BeautifulSoup(html, "html.parser")
     rows_out = []
@@ -462,9 +465,11 @@ def parse_silver_table(html):
         header_row = table.find("tr")
         if not header_row:
             continue
-        header_texts = {c.get_text(strip=True) for c in header_row.find_all(["td", "th"])}
+        header_cells_list = [c.get_text(strip=True) for c in header_row.find_all(["td", "th"])]
+        header_texts = set(header_cells_list)
         if not header_texts & header_names:
             continue  # not the table we're looking for
+        change_idx = header_cells_list.index("Biến động 24h") if "Biến động 24h" in header_cells_list else None
         for tr in table.find_all("tr"):
             cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
             if not cells or cells[0] in header_names:
@@ -472,7 +477,11 @@ def parse_silver_table(html):
             if len(cells) < 3 or not _looks_like_price(cells[1]):
                 continue
             brand, product = _split_brand_product(cells[0])
-            rows_out.append({"brand": brand, "product": product, "buy": cells[1], "sell": cells[2]})
+            change_24h = cells[change_idx] if change_idx is not None and change_idx < len(cells) else None
+            rows_out.append({
+                "brand": brand, "product": product, "buy": cells[1], "sell": cells[2],
+                "change_24h": change_24h,
+            })
     return rows_out
 
 
@@ -694,14 +703,22 @@ def _format_diff(change):
     return f"<span style='color:{color}'>{sign}{_format_vnd(diff)}{pct_str}</span>"
 
 
-def _changes_table_html(rows):
+def _changes_table_html(rows, show_source_today=False):
     period_headers = "".join(
         f"<th style='padding:8px 12px;text-align:right;'>{escape(label)}</th>" for label, _ in HISTORY_PERIODS
+    )
+    source_header = (
+        "<th style='padding:8px 12px;text-align:right;'>Hôm nay (nguồn)</th>" if show_source_today else ""
     )
     row_html = "\n".join(
         "<tr>"
         f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(r['label'])}</td>"
         f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{_format_vnd(r['current_sell'])}</td>"
+        + (
+            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-size:12px'>"
+            f"{escape(r.get('source_today') or 'Không có')}</td>"
+            if show_source_today else ""
+        )
         + "".join(
             f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-size:12px'>"
             f"{_format_diff(r['changes'][label])}</td>"
@@ -711,11 +728,12 @@ def _changes_table_html(rows):
         for r in rows
     )
     return f"""
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:700px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:800px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
           <thead>
             <tr style="background:#f5f5f5;">
               <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
               <th style="padding:8px 12px;text-align:right;">Bán ra hiện tại</th>
+              {source_header}
               {period_headers}
             </tr>
           </thead>
@@ -786,7 +804,7 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, s
         changes_parts.append(_changes_table_html(rows))
     if price_changes["silver"]:
         changes_parts.append('<h3 style="color:#666;font-size:15px;margin:20px 0 6px;">Bạc</h3>')
-        changes_parts.append(_changes_table_html(price_changes["silver"]))
+        changes_parts.append(_changes_table_html(price_changes["silver"], show_source_today=True))
     changes_html = "\n".join(changes_parts) if changes_parts else "<p>Không có dữ liệu để so sánh.</p>"
 
     return f"""\
@@ -866,8 +884,10 @@ def build_plain_text(summary_tables, details, silver, silver_details, price_chan
     lines.append(f"Nguon vang: {source_url}")
     lines.append(f"Nguon bac: {SILVER_URL}")
 
-    def _fmt_change_line(label, current_sell, changes):
+    def _fmt_change_line(label, current_sell, changes, source_today=None):
         parts = [f"{label}: ban ra {current_sell:,}".replace(",", ".")]
+        if source_today is not None:
+            parts.append(f"hom nay (nguon): {source_today or 'khong co'}")
         for period_label, _days in HISTORY_PERIODS:
             c = changes[period_label]
             if not c:
@@ -891,7 +911,7 @@ def build_plain_text(summary_tables, details, silver, silver_details, price_chan
     if price_changes["silver"]:
         lines.append("-- Bac --")
         for r in price_changes["silver"]:
-            lines.append("  " + _fmt_change_line(r["label"], r["current_sell"], r["changes"]))
+            lines.append("  " + _fmt_change_line(r["label"], r["current_sell"], r["changes"], r.get("source_today")))
 
     return "\n".join(lines)
 
@@ -946,7 +966,11 @@ def cmd_generate():
     # own "history" and every diff would show zero).
     today_snapshot = build_today_snapshot(summary_tables, silver)
     history = load_history()
-    price_changes = compute_price_changes(history, today_str, today_snapshot)
+    silver_source_changes = {}
+    if "rows" in silver:
+        for r in silver["rows"]:
+            silver_source_changes[f"{r['brand']} - {r['product']}"] = r.get("change_24h")
+    price_changes = compute_price_changes(history, today_str, today_snapshot, silver_source_changes)
     history = save_history(history, today_str, today_snapshot)
     changes_count = sum(len(rows) for rows in price_changes["gold"]) + len(price_changes["silver"])
     print(f"Price changes: computed for {changes_count} item(s) against {len(history)} day(s) of history.")
