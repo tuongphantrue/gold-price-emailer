@@ -23,13 +23,20 @@ pages are server-rendered (unlike most individual sellers' own sites, e.g.
 SJC/DOJI/PNJ/Mi Hong, which load their price tables via JavaScript and
 can't be read by a plain HTTP scraper).
 
-The email has five sections: gold summary, gold full detail per seller,
-silver summary, silver full detail per seller, and price changes over
-time (7/30/365 days, computed from a self-recorded daily snapshot since
-no robots-compliant source publishes clean historical data for all these
-sellers - silver additionally gets an immediate "today" fallback from
-giahanghoa.net's own reported 24h change, available from day one before
-the self-tracked history has accumulated enough days).
+The email has two sections:
+  1. Summary - the homepage's comparison table (one row per seller, for
+     gold bars and for gold rings), covering SJC, DOJI, PNJ, Bao Tin Minh
+     Chau, Bao Tin Manh Hai, Phu Quy, Mi Hong, and Ngoc Tham.
+  2. Full detail per seller - each seller also has its own page on
+     giavang.org (e.g. giavang.org/trong-nuoc/sjc/) with a full product
+     breakdown (gold bars in different weights, rings, various jewelry
+     purities, etc). This script fetches all 8 of those pages too and
+     includes each seller's full table as its own section, the same shape
+     baotinmanhhai.vn's own page used to provide for just that one seller.
+
+That's 1 (summary) + 8 (per-seller detail) = 9 requests to giavang.org per
+run. If a single seller's detail page fails to fetch/parse, that one
+section notes the failure and the rest of the email still sends normally.
 
 Unlike the meme bot (which dedups by post ID so it never re-sends the same
 meme), there's no natural "ID" for a price snapshot. Instead this dedups by
@@ -54,10 +61,8 @@ SETUP
        export GOLD_RECIPIENT="where-to-send@example.com"
        export SEND_ONLY_ON_CHANGE="false"          # optional, default false
        export TIMEZONE="Asia/Ho_Chi_Minh"          # optional, for the subject line
-       export SOURCE_URL="https://giavang.org/"    # optional, gold summary page
-       export SILVER_URL="https://giahanghoa.net/gia-bac"  # optional, silver summary page
+       export SOURCE_URL="https://giavang.org/"    # optional, summary page
        export STATE_FILE="state/last_price.json"   # optional, dedup state file
-       export PRICE_HISTORY_FILE="state/price_history.json"  # optional, daily snapshot history
        export ALLOW_INSECURE_SSL_FALLBACK="false"  # optional, last-resort TLS bypass
 
 SCHEDULING
@@ -67,9 +72,9 @@ schedule in the cloud without needing your own computer on.
 
 NOTE ON SCRAPING
 -----------------
-Always worth checking the current robots.txt / terms of whatever sites
-this is pointed at before running it unattended long-term, e.g.:
-    https://giavang.org/robots.txt , https://giahanghoa.net/robots.txt
+Always worth checking the current robots.txt / terms of whatever site this
+is pointed at before running it unattended long-term, e.g.:
+    https://giavang.org/robots.txt
 The page markup can also change at any time — if `generate` reports 0
 parsed rows for a section, open the relevant page, inspect the price
 table, and update the parsing functions below.
@@ -85,6 +90,7 @@ import sys
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from html import escape
 
 import certifi
@@ -102,6 +108,12 @@ if os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true":
 SOURCE_URL = os.environ.get("SOURCE_URL", "https://giavang.org/")
 DETAIL_BASE_URL = "https://giavang.org/trong-nuoc/"
 SILVER_URL = os.environ.get("SILVER_URL", "https://giahanghoa.net/gia-bac")
+WORLD_GOLD_URL = os.environ.get("WORLD_GOLD_URL", "https://giavang.org/the-gioi/")
+
+# Threshold for the "big move" alerts section: an item is flagged if any
+# available change (silver's same-day source figure, or any history-based
+# period) has an absolute percent move at or above this.
+ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "3.0"))
 
 # Some silver brands have their own dedicated, server-rendered price page
 # with a much fuller product breakdown than the giahanghoa.net comparison
@@ -576,6 +588,222 @@ def fetch_silver_details(summary_rows):
     return details
 
 
+def parse_world_gold(html):
+    """
+    Parse giavang.org's world-gold-price page. Unlike the tabular pages,
+    this one is prose text, so it's regex-matched rather than table-parsed.
+    Returns a dict with xau_usd, change_usd, change_pct, vnd_per_ounce,
+    vnd_per_luong - or None if the page's wording changed and nothing
+    matched (caller treats that as a fetch failure for this section).
+
+    The USD/VND rate isn't fetched from a separate source - it's derived
+    from vnd_per_ounce / xau_usd, since the page already publishes both
+    halves of that conversion (labeled "theo tỷ giá Vietcombank").
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    m = re.search(r"([\d,]+\.\d+)\s*USD\s*([+-]?[\d,]+\.\d+)USD\(([+-]?[\d,]+\.\d+)%\)", text)
+    if not m:
+        return None
+    result = {
+        "xau_usd": float(m.group(1).replace(",", "")),
+        "change_usd": float(m.group(2).replace(",", "")),
+        "change_pct": float(m.group(3).replace(",", "")),
+    }
+
+    m2 = re.search(r"1 Ounce\s*=\s*([\d.,]+)\s*VNĐ", text)
+    if m2:
+        result["vnd_per_ounce"] = _parse_vnd_number(m2.group(1))
+
+    m3 = re.search(r"quy đổi sang tiền Việt Nam Đồng có giá là\s*([\d.,]+)\s*VNĐ", text)
+    if m3:
+        result["vnd_per_luong"] = _parse_vnd_number(m3.group(1))
+
+    if result.get("vnd_per_ounce") and result["xau_usd"]:
+        result["implied_usdvnd_rate"] = result["vnd_per_ounce"] / result["xau_usd"]
+
+    return result
+
+
+def fetch_world_gold():
+    """Fetch + parse the world gold price page. Returns {"data": {...}}
+    on success or {"error": "...", "url": WORLD_GOLD_URL} on failure - a
+    failure here never aborts the rest of the email.
+    """
+    try:
+        html = fetch_page(WORLD_GOLD_URL)
+        data = parse_world_gold(html)
+        if not data:
+            return {"error": "Could not parse world gold price from this page.", "url": WORLD_GOLD_URL}
+        return {"data": data, "url": WORLD_GOLD_URL}
+    except requests.RequestException as e:
+        print(f"  Failed to fetch world gold price: {e}", file=sys.stderr)
+        return {"error": str(e), "url": WORLD_GOLD_URL}
+
+
+def compute_domestic_world_gap(summary_tables, world_gold):
+    """
+    For the gold-bars summary table (table index 0), compare each
+    seller's domestic sell price against the world price converted to
+    VND/lượng - the "chênh lệch giá vàng trong nước và thế giới" figure
+    that's widely watched in Vietnamese gold reporting. Returns a list of
+    {label, domestic_sell, world_vnd_per_luong, gap} or [] if there's no
+    gold-bars table or world price data to compare against.
+    """
+    if "data" not in world_gold or not world_gold["data"].get("vnd_per_luong"):
+        return []
+    if not summary_tables:
+        return []
+    world_vnd = world_gold["data"]["vnd_per_luong"]
+    rows = []
+    for r in summary_tables[0]:  # table 0 = gold bars, per SUMMARY_TABLE_LABELS
+        domestic_sell = _parse_vnd_number(r["sell"])
+        if domestic_sell is None:
+            continue
+        rows.append({
+            "label": r["label"],
+            "domestic_sell": domestic_sell,
+            "world_vnd_per_luong": world_vnd,
+            "gap": domestic_sell - world_vnd,
+        })
+    return rows
+
+
+def compute_spreads(summary_tables, silver_rows):
+    """
+    Buy/sell spread (Bán ra - Mua vào) per row, for the gold-summary
+    tables and the silver-summary rows - purely derived from data already
+    fetched elsewhere, no extra requests. Returns
+    {"gold": [[{label, buy, sell, spread, spread_pct}]], "silver": [...]}.
+    """
+    gold_spreads = []
+    for rows in summary_tables:
+        table_spreads = []
+        for r in rows:
+            buy, sell = _parse_vnd_number(r["buy"]), _parse_vnd_number(r["sell"])
+            if buy is None or sell is None:
+                continue
+            spread = sell - buy
+            table_spreads.append({
+                "label": r["label"], "buy": buy, "sell": sell,
+                "spread": spread, "spread_pct": (spread / buy * 100) if buy else None,
+            })
+        gold_spreads.append(table_spreads)
+
+    silver_spreads = []
+    for r in silver_rows:
+        buy, sell = _parse_vnd_number(r["buy"]), _parse_vnd_number(r["sell"])
+        if buy is None or sell is None:
+            continue
+        spread = sell - buy
+        silver_spreads.append({
+            "label": f"{r['brand']} - {r['product']}", "buy": buy, "sell": sell,
+            "spread": spread, "spread_pct": (spread / buy * 100) if buy else None,
+        })
+
+    return {"gold": gold_spreads, "silver": silver_spreads}
+
+
+def compute_big_moves(price_changes, threshold_pct=ALERT_THRESHOLD_PCT):
+    """
+    Scan price_changes (gold + silver) for any item whose absolute
+    percent move - on any available period, including silver's same-day
+    source figure - meets or exceeds threshold_pct. Purely derived from
+    data already computed in compute_price_changes, no extra requests.
+    Returns a list of {label, period, diff, pct} - one entry per
+    (item, period) combination that crossed the threshold, largest |pct|
+    first.
+    """
+
+    def _pct_from_source_today(s):
+        # silver's "source_today" field is a raw string like "+4.000" with
+        # no percent - can't compute a % move from it alone, so it's
+        # excluded from threshold scanning (still shown in the changes
+        # section itself, just not eligible for this alert).
+        return None
+
+    flagged = []
+    for rows in price_changes["gold"]:
+        for r in rows:
+            for period_label, change in r["changes"].items():
+                if change and change["pct"] is not None and abs(change["pct"]) >= threshold_pct:
+                    flagged.append({
+                        "label": r["label"], "period": period_label,
+                        "diff": change["diff"], "pct": change["pct"],
+                    })
+    for r in price_changes["silver"]:
+        for period_label, change in r["changes"].items():
+            if change and change["pct"] is not None and abs(change["pct"]) >= threshold_pct:
+                flagged.append({
+                    "label": r["label"], "period": period_label,
+                    "diff": change["diff"], "pct": change["pct"],
+                })
+
+    flagged.sort(key=lambda x: abs(x["pct"]), reverse=True)
+    return flagged
+
+
+def generate_price_chart(history, today_str, path):
+    """
+    Render a simple line chart of SJC gold-bars sell price and, if
+    present, the first silver item's sell price, over whatever history is
+    available (up to HISTORY_MAX_DAYS). Writes a PNG to `path` and
+    returns True, or returns False (writing nothing) if there are fewer
+    than 2 days of history to plot - a single point isn't a chart.
+
+    Matplotlib runs with the non-interactive "Agg" backend since this is
+    a headless CI environment with no display.
+    """
+    dates = sorted(d for d in history if d <= today_str)
+    if len(dates) < 2:
+        return False
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    gold_series = []
+    silver_label, silver_series = None, []
+    for d in dates:
+        snap = history[d]
+        sjc_sell = snap.get("gold", {}).get("table_0", {}).get("SJC")
+        if sjc_sell is not None:
+            gold_series.append((d, sjc_sell))
+        if silver_label is None and snap.get("silver"):
+            silver_label = next(iter(snap["silver"]))
+        if silver_label is not None:
+            sv = snap.get("silver", {}).get(silver_label)
+            if sv is not None:
+                silver_series.append((d, sv))
+
+    if not gold_series:
+        return False
+
+    fig, ax1 = plt.subplots(figsize=(7, 3.2), dpi=120)
+    xs = [datetime.strptime(d, "%Y-%m-%d") for d, _ in gold_series]
+    ys = [v / 1_000_000 for _, v in gold_series]  # triệu đồng/lượng
+    ax1.plot(xs, ys, color="#b8860b", marker="o", markersize=3, label="SJC (vàng, triệu đ/lượng)")
+    ax1.set_ylabel("Vàng SJC (triệu đ/lượng)", color="#b8860b")
+    ax1.tick_params(axis="y", labelcolor="#b8860b")
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
+
+    if silver_series and silver_label:
+        ax2 = ax1.twinx()
+        sx = [datetime.strptime(d, "%Y-%m-%d") for d, _ in silver_series]
+        sy = [v / 1000 for _, v in silver_series]  # nghìn đồng
+        ax2.plot(sx, sy, color="#888", marker="o", markersize=3, linestyle="--", label=f"{silver_label} (bạc, nghìn đ)")
+        ax2.set_ylabel(f"{silver_label} (nghìn đ)", color="#888")
+        ax2.tick_params(axis="y", labelcolor="#888")
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(path, format="png")
+    plt.close(fig)
+    return True
+
+
 def fetch_summary():
     """Fetch + parse the homepage comparison tables (one row per seller)."""
     html = fetch_page(SOURCE_URL)
@@ -743,7 +971,94 @@ def _changes_table_html(rows, show_source_today=False):
         </table>"""
 
 
-def build_html(summary_tables, details, silver, silver_details, price_changes, source_url, timestamp):
+def _world_gold_html(world_gold, gap_rows):
+    if "error" in world_gold:
+        return (
+            f"<p style='color:#a33;font-size:13px;'>Không lấy được giá vàng thế giới lần này "
+            f"({escape(world_gold['error'])}). Xem trực tiếp tại "
+            f"<a href='{escape(world_gold['url'])}'>{escape(world_gold['url'])}</a>.</p>"
+        )
+    d = world_gold["data"]
+    change_color = "#1a7a1a" if d["change_usd"] > 0 else ("#a33" if d["change_usd"] < 0 else "#666")
+    change_sign = "+" if d["change_usd"] >= 0 else ""
+    parts = [f"""
+        <p style="font-size:20px;margin:4px 0;">
+          <strong>{d['xau_usd']:,.2f} USD/oz</strong>
+          <span style="color:{change_color};font-size:14px;">{change_sign}{d['change_usd']:,.2f} USD ({change_sign}{d['change_pct']:.2f}%) trong 24h</span>
+        </p>"""]
+    if d.get("vnd_per_luong"):
+        parts.append(f"<p style='font-size:13px;color:#555;'>Quy đổi tham khảo: {_format_vnd(d['vnd_per_luong'])} đ/lượng"
+                      + (f" (tỷ giá quy đổi ~{d['implied_usdvnd_rate']:,.0f} VNĐ/USD)" if d.get("implied_usdvnd_rate") else "")
+                      + "</p>")
+    if gap_rows:
+        gap_html = "\n".join(
+            f"<tr><td style='padding:4px 12px;border-bottom:1px solid #eee'>{escape(r['label'])}</td>"
+            f"<td style='padding:4px 12px;border-bottom:1px solid #eee;text-align:right'>{_format_vnd(r['gap'])}</td></tr>"
+            for r in gap_rows
+        )
+        parts.append(f"""
+        <p style="font-size:13px;color:#555;margin-top:10px;">Chênh lệch giá vàng miếng trong nước so với thế giới (quy đổi):</p>
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:500px;font-family:Arial,Helvetica,sans-serif;font-size:13px;">
+          <tbody>{gap_html}</tbody>
+        </table>""")
+    return "\n".join(parts)
+
+
+def _spread_table_html(rows):
+    row_html = "\n".join(
+        f"<tr>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(r['label'])}</td>"
+        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{_format_vnd(r['spread'])}"
+        + (f" ({r['spread_pct']:.2f}%)" if r["spread_pct"] is not None else "")
+        + "</td></tr>"
+        for r in rows
+    )
+    return f"""
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
+          <thead>
+            <tr style="background:#f5f5f5;">
+              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
+              <th style="padding:8px 12px;text-align:right;">Chênh lệch mua-bán</th>
+            </tr>
+          </thead>
+          <tbody>{row_html}</tbody>
+        </table>"""
+
+
+def _big_moves_html(moves):
+    if not moves:
+        return "<p style='color:#666;font-size:13px;'>Không có biến động nào vượt ngưỡng " \
+               f"{ALERT_THRESHOLD_PCT:.1f}% tính đến hiện tại.</p>"
+
+    def _move_row(m):
+        color = "#1a7a1a" if m["diff"] > 0 else "#a33"
+        sign = "+" if m["diff"] >= 0 else ""
+        pct_sign = "+" if m["pct"] >= 0 else ""
+        return (
+            "<tr>"
+            f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(m['label'])}</td>"
+            f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(m['period'])}</td>"
+            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right;color:{color}'>"
+            f"{sign}{_format_vnd(m['diff'])} ({pct_sign}{m['pct']:.2f}%)</td>"
+            "</tr>"
+        )
+
+    row_html = "\n".join(_move_row(m) for m in moves)
+    return f"""
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
+          <thead>
+            <tr style="background:#fdecec;">
+              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
+              <th style="padding:8px 12px;text-align:left;">Giai đoạn</th>
+              <th style="padding:8px 12px;text-align:right;">Biến động</th>
+            </tr>
+          </thead>
+          <tbody>{row_html}</tbody>
+        </table>"""
+
+
+def build_html(summary_tables, details, silver, silver_details, price_changes, world_gold, gap_rows,
+                spreads, big_moves, has_chart, source_url, timestamp):
     # --- Section 1: summary comparison ---
     if not summary_tables:
         summary_html = (
@@ -807,6 +1122,32 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, s
         changes_parts.append(_changes_table_html(price_changes["silver"], show_source_today=True))
     changes_html = "\n".join(changes_parts) if changes_parts else "<p>Không có dữ liệu để so sánh.</p>"
 
+    # --- Section 6: world gold price + domestic-world gap ---
+    world_html = _world_gold_html(world_gold, gap_rows)
+
+    # --- Section 7: buy/sell spread ---
+    spread_parts = []
+    for i, rows in enumerate(spreads["gold"]):
+        if not rows:
+            continue
+        label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bảng {i + 1}"
+        spread_parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:16px 0 6px;">{escape(label)}</h3>')
+        spread_parts.append(_spread_table_html(rows))
+    if spreads["silver"]:
+        spread_parts.append('<h3 style="color:#666;font-size:15px;margin:20px 0 6px;">Bạc</h3>')
+        spread_parts.append(_spread_table_html(spreads["silver"]))
+    spread_html = "\n".join(spread_parts) if spread_parts else "<p>Không có dữ liệu.</p>"
+
+    # --- Section 8: big-move alerts ---
+    big_moves_html = _big_moves_html(big_moves)
+
+    # --- Section 9: price history chart ---
+    chart_html = (
+        '<img src="cid:pricechart" alt="Biểu đồ giá vàng/bạc" style="max-width:100%;border-radius:4px;" />'
+        if has_chart else
+        "<p style='color:#666;font-size:13px;'>Chưa đủ dữ liệu để vẽ biểu đồ (cần ít nhất 2 ngày lịch sử) - sẽ xuất hiện khi có thêm dữ liệu.</p>"
+    )
+
     return f"""\
 <html>
   <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
@@ -829,6 +1170,18 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, s
     {changes_html}
     <p style="color:#999;font-size:12px;margin-top:4px;">Biến động dựa trên lịch sử tự ghi nhận từ lần đầu email này chạy - có thể chưa đủ dữ liệu cho mốc 30 ngày/1 năm ngay từ đầu, sẽ đầy đủ dần theo thời gian.</p>
 
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #4a7;padding-bottom:4px;margin-top:28px;">Giá vàng thế giới &amp; chênh lệch trong nước/thế giới</h2>
+    {world_html}
+
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #4a7;padding-bottom:4px;margin-top:28px;">Chênh lệch mua-bán (spread)</h2>
+    {spread_html}
+
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #c33;padding-bottom:4px;margin-top:28px;">Cảnh báo biến động lớn (≥ {ALERT_THRESHOLD_PCT:.1f}%)</h2>
+    {big_moves_html}
+
+    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #555;padding-bottom:4px;margin-top:28px;">Biểu đồ xu hướng giá</h2>
+    {chart_html}
+
     <p style="color:#999; font-size:12px; margin-top:20px;">
       Nguồn: <a href="{escape(source_url)}">{escape(source_url)}</a> (vàng),
       <a href="{escape(SILVER_URL)}">{escape(SILVER_URL)}</a> (bạc) ·
@@ -839,7 +1192,8 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, s
 </html>"""
 
 
-def build_plain_text(summary_tables, details, silver, silver_details, price_changes, source_url, timestamp):
+def build_plain_text(summary_tables, details, silver, silver_details, price_changes, world_gold, gap_rows,
+                      spreads, big_moves, has_chart, source_url, timestamp):
     lines = [f"Gia vang & bac hom nay - cap nhat {timestamp}", "", "== VANG - TONG HOP =="]
     if not summary_tables:
         lines.append("Could not parse the summary comparison table this run.")
@@ -913,6 +1267,49 @@ def build_plain_text(summary_tables, details, silver, silver_details, price_chan
         for r in price_changes["silver"]:
             lines.append("  " + _fmt_change_line(r["label"], r["current_sell"], r["changes"], r.get("source_today")))
 
+    lines.append("")
+    lines.append("== GIA VANG THE GIOI ==")
+    if "error" in world_gold:
+        lines.append(f"  Khong lay duoc ({world_gold['error']}). Xem tai {world_gold['url']}")
+    else:
+        d = world_gold["data"]
+        lines.append(f"  XAU/USD: {d['xau_usd']:,.2f} USD/oz ({'+' if d['change_usd'] >= 0 else ''}{d['change_usd']:,.2f} USD, {'+' if d['change_pct'] >= 0 else ''}{d['change_pct']:.2f}% trong 24h)")
+        if d.get("vnd_per_luong"):
+            lines.append(f"  Quy doi tham khao: {d['vnd_per_luong']:,}".replace(",", ".") + " d/luong")
+        if gap_rows:
+            lines.append("  Chenh lech trong nuoc vs the gioi:")
+            for r in gap_rows:
+                lines.append(f"    {r['label']}: {'+' if r['gap'] >= 0 else ''}{r['gap']:,}".replace(",", ".") + " d")
+
+    lines.append("")
+    lines.append("== CHENH LECH MUA-BAN (SPREAD) ==")
+    for i, rows in enumerate(spreads["gold"]):
+        if not rows:
+            continue
+        label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bang {i + 1}"
+        lines.append(f"-- {label} --")
+        for r in rows:
+            pct = f" ({r['spread_pct']:.2f}%)" if r["spread_pct"] is not None else ""
+            lines.append(f"  {r['label']}: {r['spread']:,}".replace(",", ".") + pct)
+    if spreads["silver"]:
+        lines.append("-- Bac --")
+        for r in spreads["silver"]:
+            pct = f" ({r['spread_pct']:.2f}%)" if r["spread_pct"] is not None else ""
+            lines.append(f"  {r['label']}: {r['spread']:,}".replace(",", ".") + pct)
+
+    lines.append("")
+    lines.append(f"== CANH BAO BIEN DONG LON (>= {ALERT_THRESHOLD_PCT:.1f}%) ==")
+    if not big_moves:
+        lines.append(f"  Khong co bien dong nao vuot nguong {ALERT_THRESHOLD_PCT:.1f}%.")
+    else:
+        for m in big_moves:
+            sign = "+" if m["diff"] >= 0 else ""
+            lines.append(f"  {m['label']} ({m['period']}): {sign}{m['diff']:,}".replace(",", ".") + f" ({sign}{m['pct']:.2f}%)")
+
+    lines.append("")
+    lines.append("== BIEU DO XU HUONG GIA ==")
+    lines.append("  Xem bieu do trong email HTML." if has_chart else "  Chua du du lieu de ve bieu do.")
+
     return "\n".join(lines)
 
 
@@ -975,12 +1372,31 @@ def cmd_generate():
     changes_count = sum(len(rows) for rows in price_changes["gold"]) + len(price_changes["silver"])
     print(f"Price changes: computed for {changes_count} item(s) against {len(history)} day(s) of history.")
 
+    print(f"Fetching world gold price {WORLD_GOLD_URL} ...")
+    world_gold = fetch_world_gold()
+    print("World gold: OK." if "data" in world_gold else f"World gold: failed ({world_gold['error']}).")
+    gap_rows = compute_domestic_world_gap(summary_tables, world_gold)
+
+    spreads = compute_spreads(summary_tables, silver.get("rows", []))
+    big_moves = compute_big_moves(price_changes)
+    print(f"Big moves: {len(big_moves)} item(s) at or above {ALERT_THRESHOLD_PCT:.1f}%.")
+
+    chart_path = os.path.join(EMAIL_DIR, "chart.png")
+    try:
+        has_chart = generate_price_chart(history, today_str, chart_path)
+    except Exception as e:
+        print(f"  Chart generation failed: {e}", file=sys.stderr)
+        has_chart = False
+    print(f"Chart: {'generated' if has_chart else 'not enough history yet'}.")
+
     combined = {
         "summary": summary_tables,
         "details": details,
         "silver": silver,
         "silver_details": silver_details,
         "price_changes": price_changes,
+        "world_gold": world_gold,
+        "spreads": spreads,
     }
     price_hash = hash_data(combined)
     last_hash = load_last_hash()
@@ -992,8 +1408,14 @@ def cmd_generate():
         return
 
     subject = f"Gia vang & bac hom nay - {now.strftime('%d/%m/%Y %H:%M')}"
-    html_body = build_html(summary_tables, details, silver, silver_details, price_changes, SOURCE_URL, timestamp)
-    text_body = build_plain_text(summary_tables, details, silver, silver_details, price_changes, SOURCE_URL, timestamp)
+    html_body = build_html(
+        summary_tables, details, silver, silver_details, price_changes,
+        world_gold, gap_rows, spreads, big_moves, has_chart, SOURCE_URL, timestamp,
+    )
+    text_body = build_plain_text(
+        summary_tables, details, silver, silver_details, price_changes,
+        world_gold, gap_rows, spreads, big_moves, has_chart, SOURCE_URL, timestamp,
+    )
 
     with open(os.path.join(EMAIL_DIR, "subject.txt"), "w") as f:
         f.write(subject)
@@ -1012,6 +1434,9 @@ def cmd_generate():
                 "silver_ok": "rows" in silver,
                 "silver_detail_rows": silver_detail_count,
                 "changes_count": changes_count,
+                "world_gold_ok": "data" in world_gold,
+                "big_moves_count": len(big_moves),
+                "has_chart": has_chart,
             },
             f,
         )
@@ -1022,7 +1447,7 @@ def cmd_generate():
     print(
         f"Generated email ({summary_rows} summary rows, {detail_rows} detail rows, "
         f"{silver_rows} silver rows, {silver_detail_count} silver detail rows, "
-        f"{changes_count} change rows). Saved to ./{EMAIL_DIR}/"
+        f"{changes_count} change rows, {len(big_moves)} big moves). Saved to ./{EMAIL_DIR}/"
     )
 
 
@@ -1058,12 +1483,26 @@ def cmd_send():
     with open(os.path.join(EMAIL_DIR, "body.txt")) as f:
         text_body = f.read()
 
-    msg = MIMEMultipart("alternative")
+    # "related" wraps the text/html alternative part plus the inline chart
+    # image (if generate produced one), so <img src="cid:pricechart"> in
+    # the HTML resolves to the attached image rather than a broken link.
+    msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
-    msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(text_body, "plain"))
+    alt.attach(MIMEText(html_body, "html"))
+    msg.attach(alt)
+
+    chart_path = os.path.join(EMAIL_DIR, "chart.png")
+    if meta.get("has_chart") and os.path.exists(chart_path):
+        with open(chart_path, "rb") as f:
+            img = MIMEImage(f.read())
+        img.add_header("Content-ID", "<pricechart>")
+        img.add_header("Content-Disposition", "inline", filename="chart.png")
+        msg.attach(img)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
