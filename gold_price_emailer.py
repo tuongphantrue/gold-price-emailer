@@ -453,6 +453,21 @@ def _looks_like_price(s):
     return digits.isdigit() and len(digits) >= 5
 
 
+def _clean_change_text(s):
+    """
+    The source page renders an up/down arrow using an icon font (e.g.
+    Material Symbols), whose underlying text content is the literal word
+    "trending_up"/"trending_down"/"trending_flat" - invisible in a browser
+    (it renders as an arrow glyph) but present in the raw HTML text we
+    scrape. Strip that out so the value shown is just the number, e.g.
+    "-38.000 trending_down" -> "-38.000".
+    """
+    if not s:
+        return None
+    cleaned = re.sub(r"trending_(up|down|flat)", "", s, flags=re.IGNORECASE)
+    return cleaned.strip() or None
+
+
 def parse_silver_table(html):
     """
     Parse giahanghoa.net's silver comparison table into a list of
@@ -489,7 +504,8 @@ def parse_silver_table(html):
             if len(cells) < 3 or not _looks_like_price(cells[1]):
                 continue
             brand, product = _split_brand_product(cells[0])
-            change_24h = cells[change_idx] if change_idx is not None and change_idx < len(cells) else None
+            change_24h_raw = cells[change_idx] if change_idx is not None and change_idx < len(cells) else None
+            change_24h = _clean_change_text(change_24h_raw)
             rows_out.append({
                 "brand": brand, "product": product, "buy": cells[1], "sell": cells[2],
                 "change_24h": change_24h,
