@@ -835,85 +835,111 @@ def fetch_seller_details():
     return details
 
 
+FONT_STACK = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+
+# Design tokens. Cards use div+border-radius+box-shadow, which degrade
+# gracefully to plain square boxes in older Outlook desktop (which ignores
+# those properties) but render as intended in Gmail, Apple Mail, and most
+# modern clients - a reasonable tradeoff for a personal digest email.
+COLOR_TEXT = "#1f2937"
+COLOR_MUTED = "#6b7280"
+COLOR_BORDER = "#e6e8eb"
+COLOR_GOLD = "#a86a08"
+COLOR_GOLD_TINT = "#fdf3e2"
+COLOR_SILVER = "#52606d"
+COLOR_SILVER_TINT = "#f1f2f4"
+COLOR_BLUE = "#2563a8"
+COLOR_BLUE_TINT = "#eaf1fb"
+COLOR_GREEN_ACCENT = "#1a8a4a"
+COLOR_GREEN_TINT = "#e9f8ef"
+COLOR_RED_ACCENT = "#c23434"
+COLOR_RED_TINT = "#fdecec"
+COLOR_UP = "#1a7a1a"
+COLOR_DOWN = "#b3261e"
+COLOR_FLAT = "#6b7280"
+
+CARD_STYLE = (
+    f"background:#ffffff;border:1px solid {COLOR_BORDER};border-radius:14px;"
+    "padding:22px 24px;margin-bottom:18px;box-shadow:0 1px 3px rgba(15,23,42,0.06);"
+)
+
+
+def _card(icon, title, accent, body_html):
+    return f"""
+    <div style="{CARD_STYLE}">
+      <p style="margin:0;font-size:16.5px;font-weight:700;color:#111827;font-family:{FONT_STACK};">
+        <span style="font-size:19px;margin-right:6px;">{icon}</span>{escape(title)}
+      </p>
+      <div style="height:3px;width:42px;background:{accent};border-radius:2px;margin:8px 0 16px;"></div>
+      {body_html}
+    </div>"""
+
+
+def _tr_bg(i):
+    return "#ffffff" if i % 2 == 0 else "#f8fafc"
+
+
+def _table_open(headers, aligns, tint):
+    ths = "".join(
+        f"<th style='padding:10px 14px;text-align:{a};font-size:12px;font-weight:700;"
+        f"color:#374151;text-transform:uppercase;letter-spacing:0.03em;'>{h}</th>"
+        for h, a in zip(headers, aligns)
+    )
+    return (
+        f"<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" "
+        f"style=\"border-collapse:collapse;width:100%;font-family:{FONT_STACK};font-size:13.5px;\">"
+        f"<thead><tr style='background:{tint};'>{ths}</tr></thead><tbody>"
+    )
+
+
+_TABLE_CLOSE = "</tbody></table>"
+_TD = "padding:9px 14px;border-bottom:1px solid #f0f1f3;"
+
+
 def _region_span(region):
     if not region:
         return ""
-    return f" <span style='color:#999;font-size:12px'>({escape(region)})</span>"
+    return f" <span style='color:{COLOR_MUTED};font-size:11.5px'>({escape(region)})</span>"
 
 
-def _table_html(rows, label_header):
-    row_html = "\n".join(
-        f"<tr>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'><strong>{escape(r['label'])}</strong>"
-        f"{_region_span(r['region'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['buy'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['sell'])}</td>"
+def _table_html(rows, label_header, tint=COLOR_GOLD_TINT):
+    body = "".join(
+        f"<tr style='background:{_tr_bg(i)}'>"
+        f"<td style='{_TD}'><strong>{escape(r['label'])}</strong>{_region_span(r['region'])}</td>"
+        f"<td style='{_TD}text-align:right;'>{escape(r['buy'])}</td>"
+        f"<td style='{_TD}text-align:right;'>{escape(r['sell'])}</td>"
         f"</tr>"
-        for r in rows
+        for i, r in enumerate(rows)
     )
-    return f"""
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
-          <thead>
-            <tr style="background:#f5f5f5;">
-              <th style="padding:8px 12px;text-align:left;">{escape(label_header)}</th>
-              <th style="padding:8px 12px;text-align:right;">Mua vào</th>
-              <th style="padding:8px 12px;text-align:right;">Bán ra</th>
-            </tr>
-          </thead>
-          <tbody>
-            {row_html}
-          </tbody>
-        </table>"""
+    return _table_open([label_header, "Mua vào", "Bán ra"], ["left", "right", "right"], tint) + body + _TABLE_CLOSE
 
 
 def _silver_table_html(rows):
-    row_html = "\n".join(
-        f"<tr>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'><strong>{escape(r['brand'])}</strong></td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(r['product'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['buy'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(r['sell'])}</td>"
+    body = "".join(
+        f"<tr style='background:{_tr_bg(i)}'>"
+        f"<td style='{_TD}'><strong>{escape(r['brand'])}</strong></td>"
+        f"<td style='{_TD}'>{escape(r['product'])}</td>"
+        f"<td style='{_TD}text-align:right;'>{escape(r['buy'])}</td>"
+        f"<td style='{_TD}text-align:right;'>{escape(r['sell'])}</td>"
         f"</tr>"
-        for r in rows
+        for i, r in enumerate(rows)
     )
-    return f"""
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
-          <thead>
-            <tr style="background:#f5f5f5;">
-              <th style="padding:8px 12px;text-align:left;">Thương hiệu</th>
-              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
-              <th style="padding:8px 12px;text-align:right;">Mua vào</th>
-              <th style="padding:8px 12px;text-align:right;">Bán ra</th>
-            </tr>
-          </thead>
-          <tbody>
-            {row_html}
-          </tbody>
-        </table>"""
+    return (
+        _table_open(["Thương hiệu", "Sản phẩm", "Mua vào", "Bán ra"], ["left", "left", "right", "right"], COLOR_SILVER_TINT)
+        + body + _TABLE_CLOSE
+    )
 
 
 def _silver_detail_table_html(products):
-    row_html = "\n".join(
-        f"<tr>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(p['product'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(p['buy'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{escape(p['sell'])}</td>"
+    body = "".join(
+        f"<tr style='background:{_tr_bg(i)}'>"
+        f"<td style='{_TD}'>{escape(p['product'])}</td>"
+        f"<td style='{_TD}text-align:right;'>{escape(p['buy'])}</td>"
+        f"<td style='{_TD}text-align:right;'>{escape(p['sell'])}</td>"
         f"</tr>"
-        for p in products
+        for i, p in enumerate(products)
     )
-    return f"""
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
-          <thead>
-            <tr style="background:#f5f5f5;">
-              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
-              <th style="padding:8px 12px;text-align:right;">Mua vào</th>
-              <th style="padding:8px 12px;text-align:right;">Bán ra</th>
-            </tr>
-          </thead>
-          <tbody>
-            {row_html}
-          </tbody>
-        </table>"""
+    return _table_open(["Sản phẩm", "Mua vào", "Bán ra"], ["left", "right", "right"], COLOR_SILVER_TINT) + body + _TABLE_CLOSE
 
 
 def _format_vnd(n):
@@ -923,138 +949,124 @@ def _format_vnd(n):
 
 def _format_diff(change):
     if not change:
-        return "Chưa đủ dữ liệu"
+        return f"<span style='color:{COLOR_MUTED};font-size:12px;'>Chưa đủ dữ liệu</span>"
     diff, pct = change["diff"], change["pct"]
     sign = "+" if diff >= 0 else ""
     pct_str = f" ({sign}{pct:.2f}%)" if pct is not None else ""
-    color = "#1a7a1a" if diff > 0 else ("#a33" if diff < 0 else "#666")
-    return f"<span style='color:{color}'>{sign}{_format_vnd(diff)}{pct_str}</span>"
+    color = COLOR_UP if diff > 0 else (COLOR_DOWN if diff < 0 else COLOR_FLAT)
+    arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "•")
+    return f"<span style='color:{color};font-weight:600;'>{arrow} {sign}{_format_vnd(diff)}{pct_str}</span>"
 
 
 def _changes_table_html(rows, show_source_today=False):
-    period_headers = "".join(
-        f"<th style='padding:8px 12px;text-align:right;'>{escape(label)}</th>" for label, _ in HISTORY_PERIODS
-    )
-    source_header = (
-        "<th style='padding:8px 12px;text-align:right;'>Hôm nay (nguồn)</th>" if show_source_today else ""
-    )
-    row_html = "\n".join(
-        "<tr>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(r['label'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{_format_vnd(r['current_sell'])}</td>"
-        + (
-            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-size:12px'>"
-            f"{escape(r.get('source_today') or 'Không có')}</td>"
-            if show_source_today else ""
-        )
-        + "".join(
-            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-size:12px'>"
-            f"{_format_diff(r['changes'][label])}</td>"
-            for label, _ in HISTORY_PERIODS
-        )
-        + "</tr>"
-        for r in rows
-    )
+    headers = ["Sản phẩm", "Bán ra hiện tại"]
+    aligns = ["left", "right"]
+    if show_source_today:
+        headers.append("Hôm nay (nguồn)")
+        aligns.append("right")
+    for label, _ in HISTORY_PERIODS:
+        headers.append(label)
+        aligns.append("right")
+
+    def _row(i, r):
+        cells = [
+            f"<td style='{_TD}'>{escape(r['label'])}</td>",
+            f"<td style='{_TD}text-align:right;font-weight:600;'>{_format_vnd(r['current_sell'])}</td>",
+        ]
+        if show_source_today:
+            cells.append(f"<td style='{_TD}text-align:right;font-size:12px;'>{escape(r.get('source_today') or 'Không có')}</td>")
+        for label, _ in HISTORY_PERIODS:
+            cells.append(f"<td style='{_TD}text-align:right;font-size:12px;'>{_format_diff(r['changes'][label])}</td>")
+        return f"<tr style='background:{_tr_bg(i)}'>" + "".join(cells) + "</tr>"
+
+    body = "".join(_row(i, r) for i, r in enumerate(rows))
+    return _table_open(headers, aligns, COLOR_BLUE_TINT) + body + _TABLE_CLOSE
+
+
+def _stat_chip(label, value, sub="", accent=COLOR_GOLD):
     return f"""
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:800px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
-          <thead>
-            <tr style="background:#f5f5f5;">
-              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
-              <th style="padding:8px 12px;text-align:right;">Bán ra hiện tại</th>
-              {source_header}
-              {period_headers}
-            </tr>
-          </thead>
-          <tbody>
-            {row_html}
-          </tbody>
-        </table>"""
+        <td style="padding:6px;" width="33%">
+          <div style="background:#ffffff;border:1px solid {COLOR_BORDER};border-radius:12px;padding:14px 16px;">
+            <p style="margin:0;font-size:11px;font-weight:700;color:{COLOR_MUTED};text-transform:uppercase;letter-spacing:0.04em;">{escape(label)}</p>
+            <p style="margin:4px 0 0;font-size:19px;font-weight:700;color:{accent};">{value}</p>
+            {f"<p style='margin:2px 0 0;font-size:12px;color:{COLOR_MUTED};'>{sub}</p>" if sub else ""}
+          </div>
+        </td>"""
 
 
 def _world_gold_html(world_gold, gap_rows):
     if "error" in world_gold:
         return (
-            f"<p style='color:#a33;font-size:13px;'>Không lấy được giá vàng thế giới lần này "
+            f"<p style='color:{COLOR_DOWN};font-size:13px;'>Không lấy được giá vàng thế giới lần này "
             f"({escape(world_gold['error'])}). Xem trực tiếp tại "
             f"<a href='{escape(world_gold['url'])}'>{escape(world_gold['url'])}</a>.</p>"
         )
     d = world_gold["data"]
-    change_color = "#1a7a1a" if d["change_usd"] > 0 else ("#a33" if d["change_usd"] < 0 else "#666")
+    change_color = COLOR_UP if d["change_usd"] > 0 else (COLOR_DOWN if d["change_usd"] < 0 else COLOR_FLAT)
     change_sign = "+" if d["change_usd"] >= 0 else ""
     parts = [f"""
-        <p style="font-size:20px;margin:4px 0;">
+        <p style="font-size:22px;margin:0 0 4px;">
           <strong>{d['xau_usd']:,.2f} USD/oz</strong>
-          <span style="color:{change_color};font-size:14px;">{change_sign}{d['change_usd']:,.2f} USD ({change_sign}{d['change_pct']:.2f}%) trong 24h</span>
+          <span style="color:{change_color};font-size:14px;font-weight:600;margin-left:8px;">{change_sign}{d['change_usd']:,.2f} USD ({change_sign}{d['change_pct']:.2f}%) / 24h</span>
         </p>"""]
     if d.get("vnd_per_luong"):
-        parts.append(f"<p style='font-size:13px;color:#555;'>Quy đổi tham khảo: {_format_vnd(d['vnd_per_luong'])} đ/lượng"
-                      + (f" (tỷ giá quy đổi ~{d['implied_usdvnd_rate']:,.0f} VNĐ/USD)" if d.get("implied_usdvnd_rate") else "")
-                      + "</p>")
-    if gap_rows:
-        gap_html = "\n".join(
-            f"<tr><td style='padding:4px 12px;border-bottom:1px solid #eee'>{escape(r['label'])}</td>"
-            f"<td style='padding:4px 12px;border-bottom:1px solid #eee;text-align:right'>{_format_vnd(r['gap'])}</td></tr>"
-            for r in gap_rows
+        parts.append(
+            f"<p style='font-size:13px;color:{COLOR_MUTED};margin:0 0 12px;'>Quy đổi tham khảo: "
+            f"<strong style='color:{COLOR_TEXT}'>{_format_vnd(d['vnd_per_luong'])} đ/lượng</strong>"
+            + (f" &middot; tỷ giá quy đổi ~{d['implied_usdvnd_rate']:,.0f} VNĐ/USD" if d.get("implied_usdvnd_rate") else "")
+            + "</p>"
         )
-        parts.append(f"""
-        <p style="font-size:13px;color:#555;margin-top:10px;">Chênh lệch giá vàng miếng trong nước so với thế giới (quy đổi):</p>
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:500px;font-family:Arial,Helvetica,sans-serif;font-size:13px;">
-          <tbody>{gap_html}</tbody>
-        </table>""")
+    if gap_rows:
+        gap_body = "".join(
+            f"<tr style='background:{_tr_bg(i)}'>"
+            f"<td style='{_TD}'>{escape(r['label'])}</td>"
+            f"<td style='{_TD}text-align:right;font-weight:600;color:{COLOR_GOLD};'>{_format_vnd(r['gap'])} đ</td>"
+            f"</tr>"
+            for i, r in enumerate(gap_rows)
+        )
+        parts.append(
+            f"<p style='font-size:12.5px;color:{COLOR_MUTED};margin:0 0 8px;font-weight:600;text-transform:uppercase;letter-spacing:0.03em;'>"
+            "Chênh lệch vàng miếng trong nước so với thế giới (quy đổi)</p>"
+        )
+        parts.append(_table_open(["Đơn vị", "Chênh lệch"], ["left", "right"], COLOR_GREEN_TINT) + gap_body + _TABLE_CLOSE)
     return "\n".join(parts)
 
 
 def _spread_table_html(rows):
-    row_html = "\n".join(
-        f"<tr>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(r['label'])}</td>"
-        f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right'>{_format_vnd(r['spread'])}"
-        + (f" ({r['spread_pct']:.2f}%)" if r["spread_pct"] is not None else "")
+    body = "".join(
+        f"<tr style='background:{_tr_bg(i)}'>"
+        f"<td style='{_TD}'>{escape(r['label'])}</td>"
+        f"<td style='{_TD}text-align:right;font-weight:600;'>{_format_vnd(r['spread'])}"
+        + (f" <span style='color:{COLOR_MUTED};font-weight:400;'>({r['spread_pct']:.2f}%)</span>" if r["spread_pct"] is not None else "")
         + "</td></tr>"
-        for r in rows
+        for i, r in enumerate(rows)
     )
-    return f"""
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
-          <thead>
-            <tr style="background:#f5f5f5;">
-              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
-              <th style="padding:8px 12px;text-align:right;">Chênh lệch mua-bán</th>
-            </tr>
-          </thead>
-          <tbody>{row_html}</tbody>
-        </table>"""
+    return _table_open(["Sản phẩm", "Chênh lệch mua-bán"], ["left", "right"], COLOR_BLUE_TINT) + body + _TABLE_CLOSE
 
 
 def _big_moves_html(moves):
     if not moves:
-        return "<p style='color:#666;font-size:13px;'>Không có biến động nào vượt ngưỡng " \
-               f"{ALERT_THRESHOLD_PCT:.1f}% tính đến hiện tại.</p>"
+        return (
+            f"<p style='color:{COLOR_MUTED};font-size:13px;margin:0;'>✅ Không có biến động nào vượt ngưỡng "
+            f"{ALERT_THRESHOLD_PCT:.1f}% tính đến hiện tại.</p>"
+        )
 
-    def _move_row(m):
-        color = "#1a7a1a" if m["diff"] > 0 else "#a33"
+    def _move_row(i, m):
+        color = COLOR_UP if m["diff"] > 0 else COLOR_DOWN
+        arrow = "▲" if m["diff"] > 0 else "▼"
         sign = "+" if m["diff"] >= 0 else ""
         pct_sign = "+" if m["pct"] >= 0 else ""
         return (
-            "<tr>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(m['label'])}</td>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #eee'>{escape(m['period'])}</td>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:right;color:{color}'>"
-            f"{sign}{_format_vnd(m['diff'])} ({pct_sign}{m['pct']:.2f}%)</td>"
+            f"<tr style='background:{_tr_bg(i)}'>"
+            f"<td style='{_TD}'>{escape(m['label'])}</td>"
+            f"<td style='{_TD}color:{COLOR_MUTED};'>{escape(m['period'])}</td>"
+            f"<td style='{_TD}text-align:right;color:{color};font-weight:700;'>"
+            f"{arrow} {sign}{_format_vnd(m['diff'])} ({pct_sign}{m['pct']:.2f}%)</td>"
             "</tr>"
         )
 
-    row_html = "\n".join(_move_row(m) for m in moves)
-    return f"""
-        <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:600px;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
-          <thead>
-            <tr style="background:#fdecec;">
-              <th style="padding:8px 12px;text-align:left;">Sản phẩm</th>
-              <th style="padding:8px 12px;text-align:left;">Giai đoạn</th>
-              <th style="padding:8px 12px;text-align:right;">Biến động</th>
-            </tr>
-          </thead>
-          <tbody>{row_html}</tbody>
-        </table>"""
+    body = "".join(_move_row(i, m) for i, m in enumerate(moves))
+    return _table_open(["Sản phẩm", "Giai đoạn", "Biến động"], ["left", "left", "right"], COLOR_RED_TINT) + body + _TABLE_CLOSE
 
 
 def build_html(summary_tables, details, silver, silver_details, price_changes, world_gold, gap_rows,
@@ -1069,17 +1081,18 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
         parts = []
         for i, rows in enumerate(summary_tables):
             label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bảng {i + 1}"
-            parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:16px 0 6px;">{escape(label)}</h3>')
+            if i > 0:
+                parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_MUTED};margin:16px 0 8px;'>{escape(label)}</p>")
             parts.append(_table_html(rows, "Đơn vị bán"))
         summary_html = "\n".join(parts)
 
     # --- Section 2: full detail per seller ---
     detail_parts = []
     for name, info in details.items():
-        detail_parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:20px 0 6px;">{escape(name)}</h3>')
+        detail_parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_GOLD};margin:16px 0 8px;'>{escape(name)}</p>")
         if "error" in info:
             detail_parts.append(
-                f"<p style='color:#a33;font-size:13px;'>Không lấy được dữ liệu chi tiết lần này "
+                f"<p style='color:{COLOR_DOWN};font-size:13px;'>Không lấy được dữ liệu chi tiết lần này "
                 f"({escape(info['error'])}). Xem trực tiếp tại "
                 f"<a href='{escape(info['url'])}'>{escape(info['url'])}</a>.</p>"
             )
@@ -1091,7 +1104,7 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
     # --- Section 3: silver ---
     if "error" in silver:
         silver_html = (
-            f"<p style='color:#a33;font-size:13px;'>Không lấy được giá bạc lần này "
+            f"<p style='color:{COLOR_DOWN};font-size:13px;'>Không lấy được giá bạc lần này "
             f"({escape(silver['error'])}). Xem trực tiếp tại "
             f"<a href='{escape(silver['url'])}'>{escape(silver['url'])}</a>.</p>"
         )
@@ -1100,10 +1113,10 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
 
     silver_detail_parts = []
     for brand, info in silver_details.items():
-        silver_detail_parts.append(f'<h3 style="color:#666;font-size:15px;margin:20px 0 6px;">{escape(brand)}</h3>')
+        silver_detail_parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_SILVER};margin:16px 0 8px;'>{escape(brand)}</p>")
         if not info["source"]:
             silver_detail_parts.append(
-                "<p style='color:#999;font-size:12px;margin:0 0 6px;'>"
+                f"<p style='color:{COLOR_MUTED};font-size:12px;margin:0 0 6px;'>"
                 "(Không có trang chi tiết riêng cho đơn vị này - hiển thị dữ liệu từ bảng tổng hợp.)</p>"
             )
         silver_detail_parts.append(_silver_detail_table_html(info["products"]))
@@ -1115,12 +1128,16 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
         if not rows:
             continue
         label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bảng {i + 1}"
-        changes_parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:16px 0 6px;">{escape(label)}</h3>')
+        changes_parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_GOLD};margin:16px 0 8px;'>{escape(label)}</p>")
         changes_parts.append(_changes_table_html(rows))
     if price_changes["silver"]:
-        changes_parts.append('<h3 style="color:#666;font-size:15px;margin:20px 0 6px;">Bạc</h3>')
+        changes_parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_SILVER};margin:16px 0 8px;'>Bạc</p>")
         changes_parts.append(_changes_table_html(price_changes["silver"], show_source_today=True))
     changes_html = "\n".join(changes_parts) if changes_parts else "<p>Không có dữ liệu để so sánh.</p>"
+    changes_html += (
+        f"<p style='color:{COLOR_MUTED};font-size:11.5px;margin-top:10px;'>Biến động dựa trên lịch sử tự ghi nhận "
+        "từ lần đầu email này chạy - có thể chưa đủ dữ liệu cho mốc 30 ngày/1 năm ngay từ đầu, sẽ đầy đủ dần theo thời gian.</p>"
+    )
 
     # --- Section 6: world gold price + domestic-world gap ---
     world_html = _world_gold_html(world_gold, gap_rows)
@@ -1131,10 +1148,10 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
         if not rows:
             continue
         label = SUMMARY_TABLE_LABELS[i] if i < len(SUMMARY_TABLE_LABELS) else f"Bảng {i + 1}"
-        spread_parts.append(f'<h3 style="color:#b8860b;font-size:15px;margin:16px 0 6px;">{escape(label)}</h3>')
+        spread_parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_GOLD};margin:16px 0 8px;'>{escape(label)}</p>")
         spread_parts.append(_spread_table_html(rows))
     if spreads["silver"]:
-        spread_parts.append('<h3 style="color:#666;font-size:15px;margin:20px 0 6px;">Bạc</h3>')
+        spread_parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_SILVER};margin:16px 0 8px;'>Bạc</p>")
         spread_parts.append(_spread_table_html(spreads["silver"]))
     spread_html = "\n".join(spread_parts) if spread_parts else "<p>Không có dữ liệu.</p>"
 
@@ -1143,53 +1160,81 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
 
     # --- Section 9: price history chart ---
     chart_html = (
-        '<img src="cid:pricechart" alt="Biểu đồ giá vàng/bạc" style="max-width:100%;border-radius:4px;" />'
+        '<img src="cid:pricechart" alt="Biểu đồ giá vàng/bạc" style="max-width:100%;border-radius:10px;display:block;" />'
         if has_chart else
-        "<p style='color:#666;font-size:13px;'>Chưa đủ dữ liệu để vẽ biểu đồ (cần ít nhất 2 ngày lịch sử) - sẽ xuất hiện khi có thêm dữ liệu.</p>"
+        f"<p style='color:{COLOR_MUTED};font-size:13px;'>Chưa đủ dữ liệu để vẽ biểu đồ (cần ít nhất 2 ngày lịch sử) - sẽ xuất hiện khi có thêm dữ liệu.</p>"
+    )
+
+    # --- Hero stat chips (SJC now, world price, alert count) ---
+    sjc_sell = next(
+        (r["sell"] for r in (summary_tables[0] if summary_tables else []) if r["label"] == "SJC"),
+        None,
+    )
+    world_price_str = (
+        f"{world_gold['data']['xau_usd']:,.0f} USD/oz" if "data" in world_gold else "N/A"
+    )
+    moves_color = COLOR_RED_ACCENT if big_moves else COLOR_GREEN_ACCENT
+    chips = (
+        _stat_chip("Vàng SJC (bán ra)", sjc_sell or "N/A", "đồng/lượng", COLOR_GOLD)
+        + _stat_chip("Vàng thế giới", world_price_str, "XAU/USD", COLOR_BLUE)
+        + _stat_chip("Biến động lớn", str(len(big_moves)), f"≥ {ALERT_THRESHOLD_PCT:.0f}% ghi nhận", moves_color)
     )
 
     return f"""\
 <html>
-  <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
-    <h1 style="color:#b8860b;">Giá vàng &amp; bạc hôm nay - các đơn vị lớn tại Việt Nam</h1>
-    <p style="color:#555;">Cập nhật {escape(timestamp)}</p>
+  <body style="margin:0;padding:0;background:#eef1f5;font-family:{FONT_STACK};">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;">
+      <tr>
+        <td align="center" style="padding:24px 12px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;">
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;">Vàng - Tổng hợp so sánh giữa các đơn vị</h2>
-    {summary_html}
+            <!-- Header banner -->
+            <tr>
+              <td style="background:linear-gradient(135deg,#8a5a0f,#b8860b);border-radius:16px 16px 0 0;padding:26px 28px;">
+                <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">🪙 Giá vàng &amp; bạc hôm nay</p>
+                <p style="margin:6px 0 0;font-size:13px;color:#f5e7c8;">Các đơn vị lớn tại Việt Nam &middot; Cập nhật {escape(timestamp)}</p>
+              </td>
+            </tr>
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #b8860b;padding-bottom:4px;margin-top:28px;">Vàng - Chi tiết đầy đủ theo từng đơn vị</h2>
-    {detail_html}
+            <!-- Hero stat chips -->
+            <tr>
+              <td style="background:#ffffff;border-left:1px solid {COLOR_BORDER};border-right:1px solid {COLOR_BORDER};padding:14px 16px 4px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>{chips}</tr></table>
+              </td>
+            </tr>
+            <tr><td style="background:#ffffff;border-left:1px solid {COLOR_BORDER};border-right:1px solid {COLOR_BORDER};border-bottom:1px solid {COLOR_BORDER};border-radius:0 0 16px 16px;padding:0 0 18px;"></td></tr>
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #888;padding-bottom:4px;margin-top:28px;">Bạc - So sánh giữa các đơn vị</h2>
-    {silver_html}
+            <tr><td style="height:20px;"></td></tr>
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #888;padding-bottom:4px;margin-top:28px;">Bạc - Chi tiết đầy đủ theo từng đơn vị</h2>
-    {silver_detail_html}
+            <tr><td>{_card("🥇", "Vàng - Tổng hợp so sánh giữa các đơn vị", COLOR_GOLD, summary_html)}</td></tr>
+            <tr><td>{_card("📋", "Vàng - Chi tiết đầy đủ theo từng đơn vị", COLOR_GOLD, detail_html)}</td></tr>
+            <tr><td>{_card("🥈", "Bạc - So sánh giữa các đơn vị", COLOR_SILVER, silver_html)}</td></tr>
+            <tr><td>{_card("📋", "Bạc - Chi tiết đầy đủ theo từng đơn vị", COLOR_SILVER, silver_detail_html)}</td></tr>
+            <tr><td>{_card("📊", "Biến động giá (7 ngày / 30 ngày / 1 năm)", COLOR_BLUE, changes_html)}</td></tr>
+            <tr><td>{_card("🌍", "Giá vàng thế giới &amp; chênh lệch trong nước/thế giới", COLOR_GREEN_ACCENT, world_html)}</td></tr>
+            <tr><td>{_card("↔️", "Chênh lệch mua-bán (spread)", COLOR_BLUE, spread_html)}</td></tr>
+            <tr><td>{_card("🚨", f"Cảnh báo biến động lớn (&ge; {ALERT_THRESHOLD_PCT:.1f}%)", COLOR_RED_ACCENT, big_moves_html)}</td></tr>
+            <tr><td>{_card("📈", "Biểu đồ xu hướng giá", COLOR_TEXT, chart_html)}</td></tr>
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #555;padding-bottom:4px;margin-top:28px;">Biến động giá (so với 7 ngày / 30 ngày / 1 năm trước)</h2>
-    {changes_html}
-    <p style="color:#999;font-size:12px;margin-top:4px;">Biến động dựa trên lịch sử tự ghi nhận từ lần đầu email này chạy - có thể chưa đủ dữ liệu cho mốc 30 ngày/1 năm ngay từ đầu, sẽ đầy đủ dần theo thời gian.</p>
+            <tr>
+              <td style="padding:8px 6px 0;">
+                <p style="color:{COLOR_MUTED};font-size:11.5px;line-height:1.6;margin:0;">
+                  Nguồn: <a href="{escape(source_url)}" style="color:{COLOR_BLUE};">{escape(source_url)}</a> (vàng),
+                  <a href="{escape(SILVER_URL)}" style="color:{COLOR_BLUE};">{escape(SILVER_URL)}</a> (bạc) &middot;
+                  Đơn vị: nghìn đồng/lượng trừ khi ghi chú khác trên trang gốc &middot;
+                  Email tự động, chỉ mang tính tham khảo, không phải lời khuyên đầu tư.
+                </p>
+              </td>
+            </tr>
 
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #4a7;padding-bottom:4px;margin-top:28px;">Giá vàng thế giới &amp; chênh lệch trong nước/thế giới</h2>
-    {world_html}
-
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #4a7;padding-bottom:4px;margin-top:28px;">Chênh lệch mua-bán (spread)</h2>
-    {spread_html}
-
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #c33;padding-bottom:4px;margin-top:28px;">Cảnh báo biến động lớn (≥ {ALERT_THRESHOLD_PCT:.1f}%)</h2>
-    {big_moves_html}
-
-    <h2 style="color:#333;font-size:18px;border-bottom:2px solid #555;padding-bottom:4px;margin-top:28px;">Biểu đồ xu hướng giá</h2>
-    {chart_html}
-
-    <p style="color:#999; font-size:12px; margin-top:20px;">
-      Nguồn: <a href="{escape(source_url)}">{escape(source_url)}</a> (vàng),
-      <a href="{escape(SILVER_URL)}">{escape(SILVER_URL)}</a> (bạc) ·
-      Đơn vị: nghìn đồng/lượng trừ khi ghi chú khác trên trang gốc ·
-      Email tự động, chỉ mang tính tham khảo, không phải lời khuyên đầu tư.
-    </p>
+          </table>
+        </td>
+      </tr>
+    </table>
   </body>
 </html>"""
+
+
 
 
 def build_plain_text(summary_tables, details, silver, silver_details, price_changes, world_gold, gap_rows,
