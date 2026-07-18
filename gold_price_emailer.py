@@ -379,24 +379,35 @@ def fetch_page(url):
     "false" unless you've confirmed via README's troubleshooting section
     that the failure really is a broken certificate chain on the site's
     end, not a MITM.
+
+    If a request times out or the connection drops, one retry is made
+    with a longer timeout before giving up - with 12 pages fetched every
+    run, an occasional slow response from one of them is expected, and a
+    single timeout shouldn't take down that whole section of the email.
     """
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15, verify=certifi.where())
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.SSLError as e:
-        print(f"  TLS verification failed with certifi's CA bundle: {e}", file=sys.stderr)
-        if not ALLOW_INSECURE_SSL_FALLBACK:
-            print(
-                "  Set ALLOW_INSECURE_SSL_FALLBACK=true to retry without verification "
-                "as a last resort (see README troubleshooting section first).",
-                file=sys.stderr,
-            )
+    for attempt, timeout in enumerate((15, 30), start=1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout, verify=certifi.where())
+            resp.raise_for_status()
+            return resp.text
+        except requests.exceptions.SSLError as e:
+            print(f"  TLS verification failed with certifi's CA bundle: {e}", file=sys.stderr)
+            if not ALLOW_INSECURE_SSL_FALLBACK:
+                print(
+                    "  Set ALLOW_INSECURE_SSL_FALLBACK=true to retry without verification "
+                    "as a last resort (see README troubleshooting section first).",
+                    file=sys.stderr,
+                )
+                raise
+            print("  ALLOW_INSECURE_SSL_FALLBACK=true - retrying with TLS verification disabled.", file=sys.stderr)
+            resp = requests.get(url, headers=HEADERS, timeout=timeout, verify=False)
+            resp.raise_for_status()
+            return resp.text
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt == 1:
+                print(f"  {url} - {e} - retrying once with a longer timeout ({timeout + 15}s)...", file=sys.stderr)
+                continue
             raise
-        print("  ALLOW_INSECURE_SSL_FALLBACK=true - retrying with TLS verification disabled.", file=sys.stderr)
-        resp = requests.get(url, headers=HEADERS, timeout=15, verify=False)
-        resp.raise_for_status()
-        return resp.text
 
 
 def parse_comparison_tables(html):
@@ -619,7 +630,9 @@ def parse_world_gold(html):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    m = re.search(r"([\d,]+\.\d+)\s*USD\s*([+-]?[\d,]+\.\d+)USD\(([+-]?[\d,]+\.\d+)%\)", text)
+    m = re.search(
+        r"([\d,]+\.\d+)\s*USD\s*([+-]?[\d,]+\.\d+)\s*USD\s*\(\s*([+-]?[\d,]+\.\d+)\s*%\s*\)", text
+    )
     if not m:
         return None
     result = {
@@ -628,11 +641,11 @@ def parse_world_gold(html):
         "change_pct": float(m.group(3).replace(",", "")),
     }
 
-    m2 = re.search(r"1 Ounce\s*=\s*([\d.,]+)\s*VNĐ", text)
+    m2 = re.search(r"1\s*Ounce\s*=\s*([\d.,]+)\s*VNĐ", text)
     if m2:
         result["vnd_per_ounce"] = _parse_vnd_number(m2.group(1))
 
-    m3 = re.search(r"quy đổi sang tiền Việt Nam Đồng có giá là\s*([\d.,]+)\s*VNĐ", text)
+    m3 = re.search(r"quy\s*đổi\s*sang\s*tiền\s*Việt\s*Nam\s*Đồng\s*có\s*giá\s*là\s*([\d.,]+)\s*VNĐ", text)
     if m3:
         result["vnd_per_luong"] = _parse_vnd_number(m3.group(1))
 
@@ -1227,9 +1240,9 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
             <tr><td>{_card("🥈", "Bạc - So sánh giữa các đơn vị", COLOR_SILVER, silver_html)}</td></tr>
             <tr><td>{_card("📋", "Bạc - Chi tiết đầy đủ theo từng đơn vị", COLOR_SILVER, silver_detail_html)}</td></tr>
             <tr><td>{_card("📊", "Biến động giá (7 ngày / 30 ngày / 1 năm)", COLOR_BLUE, changes_html)}</td></tr>
-            <tr><td>{_card("🌍", "Giá vàng thế giới &amp; chênh lệch trong nước/thế giới", COLOR_GREEN_ACCENT, world_html)}</td></tr>
+            <tr><td>{_card("🌍", "Giá vàng thế giới & chênh lệch trong nước/thế giới", COLOR_GREEN_ACCENT, world_html)}</td></tr>
             <tr><td>{_card("↔️", "Chênh lệch mua-bán (spread)", COLOR_BLUE, spread_html)}</td></tr>
-            <tr><td>{_card("🚨", f"Cảnh báo biến động lớn (&ge; {ALERT_THRESHOLD_PCT:.1f}%)", COLOR_RED_ACCENT, big_moves_html)}</td></tr>
+            <tr><td>{_card("🚨", f"Cảnh báo biến động lớn (≥ {ALERT_THRESHOLD_PCT:.1f}%)", COLOR_RED_ACCENT, big_moves_html)}</td></tr>
             <tr><td>{_card("📈", "Biểu đồ xu hướng giá", COLOR_TEXT, chart_html)}</td></tr>
 
             <tr>
