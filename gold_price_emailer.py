@@ -91,6 +91,7 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
+from email.mime.application import MIMEApplication
 from html import escape
 
 import certifi
@@ -114,6 +115,42 @@ WORLD_GOLD_URL = os.environ.get("WORLD_GOLD_URL", "https://giavang.org/the-gioi/
 # available change (silver's same-day source figure, or any history-based
 # period) has an absolute percent move at or above this.
 ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "3.0"))
+
+VCB_RATE_URL = os.environ.get("VCB_RATE_URL", "https://tygiausd.org/nganhang/vietcombank")
+
+# Optional: restrict big-move alert scanning to specific item labels, e.g.
+# "SJC,Phu Quy - BAC MIENG PHU QUY 999 1 LUONG" (comma-separated, must match
+# the label text used elsewhere in the email exactly). Empty (default)
+# means all tracked items are scanned, same as before this was added.
+WATCHLIST = [s.strip() for s in os.environ.get("WATCHLIST", "").split(",") if s.strip()]
+
+# Optional: per-item alert threshold overriding ALERT_THRESHOLD_PCT, as a
+# JSON object string, e.g. '{"SJC": 2.0, "DOJI": 5.0}'. Items not listed
+# use ALERT_THRESHOLD_PCT.
+try:
+    ALERT_THRESHOLDS_OVERRIDE = json.loads(os.environ.get("ALERT_THRESHOLDS_JSON", "{}"))
+except json.JSONDecodeError:
+    print("  ALERT_THRESHOLDS_JSON is not valid JSON - ignoring, using ALERT_THRESHOLD_PCT for everything.", file=sys.stderr)
+    ALERT_THRESHOLDS_OVERRIDE = {}
+
+# Optional: your holdings, as a JSON list string, e.g.
+#   '[{"label": "SJC", "kind": "gold", "amount": 2, "buy_price": 140000000},
+#     {"label": "Phú Quý - BẠC MIẾNG PHÚ QUÝ 999 1 LƯỢNG", "kind": "silver", "amount": 10, "buy_price": 2100000}]'
+# "label" must match the item's label exactly as it appears elsewhere in
+# the email (seller name for gold-bars row 0, or "brand - product" for
+# silver). "amount" is in the same unit the source quotes that item in
+# (typically lượng for gold, lượng/kg for silver depending on product).
+# "buy_price" is your cost basis per unit, same currency/unit as the
+# source's price. Leave HOLDINGS_JSON unset/empty to skip this section.
+try:
+    HOLDINGS = json.loads(os.environ.get("HOLDINGS_JSON", "[]"))
+except json.JSONDecodeError:
+    print("  HOLDINGS_JSON is not valid JSON - ignoring, portfolio section will be empty.", file=sys.stderr)
+    HOLDINGS = []
+
+# Periods (label, days) for the 30/90-day high/low extremes section -
+# reuses the same price_history.json the changes section depends on.
+EXTREME_PERIODS = [("30 ngày", 30), ("90 ngày", 90)]
 
 # Some silver brands have their own dedicated, server-rendered price page
 # with a much fuller product breakdown than the giahanghoa.net comparison
@@ -655,6 +692,45 @@ def parse_world_gold(html):
     return result
 
 
+def parse_vcb_rate(html):
+    """
+    Parse tygiausd.org's Vietcombank rate table for the USD row. Returns
+    {"buy": int, "transfer": int, "sell": int} or None if the USD row
+    wasn't found (page structure changed).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        header_row = table.find("tr")
+        if not header_row:
+            continue
+        header = [c.get_text(strip=True) for c in header_row.find_all(["td", "th"])]
+        if "Mã NT" not in header:
+            continue
+        for tr in table.find_all("tr")[1:]:
+            cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+            if len(cells) >= 5 and cells[0] == "USD":
+                buy, transfer, sell = _parse_vnd_number(cells[2]), _parse_vnd_number(cells[3]), _parse_vnd_number(cells[4])
+                if sell is not None:
+                    return {"buy": buy, "transfer": transfer, "sell": sell}
+    return None
+
+
+def fetch_vcb_rate():
+    """Fetch + parse the real Vietcombank USD/VND rate. Returns
+    {"data": {...}} on success or {"error": "...", "url": VCB_RATE_URL}
+    on failure - never aborts the rest of the email.
+    """
+    try:
+        html = fetch_page(VCB_RATE_URL)
+        data = parse_vcb_rate(html)
+        if not data:
+            return {"error": "Could not find the USD row on this page.", "url": VCB_RATE_URL}
+        return {"data": data, "url": VCB_RATE_URL}
+    except requests.RequestException as e:
+        print(f"  Failed to fetch Vietcombank rate: {e}", file=sys.stderr)
+        return {"error": str(e), "url": VCB_RATE_URL}
+
+
 def fetch_world_gold():
     """Fetch + parse the world gold price page. Returns {"data": {...}}
     on success or {"error": "...", "url": WORLD_GOLD_URL} on failure - a
@@ -734,40 +810,42 @@ def compute_spreads(summary_tables, silver_rows):
     return {"gold": gold_spreads, "silver": silver_spreads}
 
 
-def compute_big_moves(price_changes, threshold_pct=ALERT_THRESHOLD_PCT):
+def compute_big_moves(price_changes, threshold_pct=ALERT_THRESHOLD_PCT, watchlist=None, thresholds_override=None):
     """
     Scan price_changes (gold + silver) for any item whose absolute
-    percent move - on any available period, including silver's same-day
-    source figure - meets or exceeds threshold_pct. Purely derived from
-    data already computed in compute_price_changes, no extra requests.
-    Returns a list of {label, period, diff, pct} - one entry per
-    (item, period) combination that crossed the threshold, largest |pct|
-    first.
-    """
+    percent move - on any available period - meets or exceeds its
+    threshold. Purely derived from data already computed in
+    compute_price_changes, no extra requests. Returns a list of
+    {label, period, diff, pct} - one entry per (item, period) combination
+    that crossed the threshold, largest |pct| first.
 
-    def _pct_from_source_today(s):
-        # silver's "source_today" field is a raw string like "+4.000" with
-        # no percent - can't compute a % move from it alone, so it's
-        # excluded from threshold scanning (still shown in the changes
-        # section itself, just not eligible for this alert).
-        return None
+    watchlist (optional): if non-empty, only labels in this list are
+    scanned - everything else is skipped regardless of how much it moved.
+    thresholds_override (optional): {label: pct} - use this item's own
+    threshold instead of threshold_pct when present.
+    """
+    watchlist = set(watchlist) if watchlist else None
+    thresholds_override = thresholds_override or {}
+
+    def _threshold_for(label):
+        return thresholds_override.get(label, threshold_pct)
+
+    def _scan(label, changes):
+        if watchlist and label not in watchlist:
+            return []
+        item_threshold = _threshold_for(label)
+        out = []
+        for period_label, change in changes.items():
+            if change and change["pct"] is not None and abs(change["pct"]) >= item_threshold:
+                out.append({"label": label, "period": period_label, "diff": change["diff"], "pct": change["pct"]})
+        return out
 
     flagged = []
     for rows in price_changes["gold"]:
         for r in rows:
-            for period_label, change in r["changes"].items():
-                if change and change["pct"] is not None and abs(change["pct"]) >= threshold_pct:
-                    flagged.append({
-                        "label": r["label"], "period": period_label,
-                        "diff": change["diff"], "pct": change["pct"],
-                    })
+            flagged.extend(_scan(r["label"], r["changes"]))
     for r in price_changes["silver"]:
-        for period_label, change in r["changes"].items():
-            if change and change["pct"] is not None and abs(change["pct"]) >= threshold_pct:
-                flagged.append({
-                    "label": r["label"], "period": period_label,
-                    "diff": change["diff"], "pct": change["pct"],
-                })
+        flagged.extend(_scan(r["label"], r["changes"]))
 
     flagged.sort(key=lambda x: abs(x["pct"]), reverse=True)
     return flagged
@@ -833,6 +911,132 @@ def generate_price_chart(history, today_str, path):
     return True
 
 
+def compute_extremes(history, today_str, today_snapshot):
+    """
+    For each gold-summary and silver-summary item, check whether today's
+    sell price is at or beyond the min/max seen in price_history.json
+    over the last N days (EXTREME_PERIODS), i.e. "today is a 30-day low"
+    style flags. Only flags items where at least 2 days of history exist
+    in that window (a single data point isn't a meaningful high/low).
+    Returns a list of {label, period, kind: "low"|"high", value}.
+    """
+
+    def _window_values(key_path, days_ago):
+        cutoff = (datetime.strptime(today_str, "%Y-%m-%d") - _timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        values = []
+        for date_str, snap in history.items():
+            if cutoff <= date_str <= today_str:
+                v = key_path(snap)
+                if v is not None:
+                    values.append(v)
+        return values
+
+    flags = []
+
+    for table_key, items in today_snapshot["gold"].items():
+        for label, current in items.items():
+            for period_label, days in EXTREME_PERIODS:
+                values = _window_values(lambda snap, tk=table_key, lb=label: snap.get("gold", {}).get(tk, {}).get(lb), days)
+                values.append(current)
+                if len(values) < 3:
+                    continue
+                if current <= min(values):
+                    flags.append({"label": label, "period": period_label, "kind": "low", "value": current})
+                elif current >= max(values):
+                    flags.append({"label": label, "period": period_label, "kind": "high", "value": current})
+
+    for key, current in today_snapshot["silver"].items():
+        for period_label, days in EXTREME_PERIODS:
+            values = _window_values(lambda snap, k=key: snap.get("silver", {}).get(k), days)
+            values.append(current)
+            if len(values) < 3:
+                continue
+            if current <= min(values):
+                flags.append({"label": key, "period": period_label, "kind": "low", "value": current})
+            elif current >= max(values):
+                flags.append({"label": key, "period": period_label, "kind": "high", "value": current})
+
+    return flags
+
+
+def compute_holdings(holdings_config, summary_tables, silver_rows):
+    """
+    Compute current value/gain-loss for each configured holding (see
+    HOLDINGS_JSON above). Matches each holding's "label" against the
+    gold-bars summary table (table 0) by seller name, or against silver
+    summary rows by "brand - product". Holdings whose label doesn't match
+    anything currently fetched are skipped (with a note) rather than
+    causing an error, since a temporarily-failed fetch shouldn't break
+    the whole portfolio section.
+
+    Returns {"items": [...], "total_value": int, "total_cost": int,
+    "total_gain": int} or {"items": []} if HOLDINGS_JSON is empty/unset.
+    """
+    if not holdings_config:
+        return {"items": [], "total_value": 0, "total_cost": 0, "total_gain": 0}
+
+    gold_prices = {}
+    if summary_tables:
+        for r in summary_tables[0]:
+            price = _parse_vnd_number(r["sell"])
+            if price is not None:
+                gold_prices[r["label"]] = price
+
+    silver_prices = {}
+    for r in silver_rows:
+        price = _parse_vnd_number(r["sell"])
+        if price is not None:
+            silver_prices[f"{r['brand']} - {r['product']}"] = price
+
+    items = []
+    total_value = total_cost = 0
+    for h in holdings_config:
+        label, kind, amount, buy_price = h.get("label"), h.get("kind"), h.get("amount"), h.get("buy_price")
+        if not label or amount is None or buy_price is None:
+            continue
+        current_price = (gold_prices if kind == "gold" else silver_prices).get(label)
+        if current_price is None:
+            items.append({"label": label, "matched": False})
+            continue
+        value = current_price * amount
+        cost = buy_price * amount
+        gain = value - cost
+        gain_pct = (gain / cost * 100) if cost else None
+        items.append({
+            "label": label, "matched": True, "amount": amount, "current_price": current_price,
+            "buy_price": buy_price, "value": value, "cost": cost, "gain": gain, "gain_pct": gain_pct,
+        })
+        total_value += value
+        total_cost += cost
+
+    return {
+        "items": items, "total_value": total_value, "total_cost": total_cost,
+        "total_gain": total_value - total_cost,
+    }
+
+
+def compute_source_health(details, silver, silver_details, world_gold, vcb_rate):
+    """
+    One-line-per-source summary of what fetched successfully this run,
+    so a partial failure is visible in the email itself rather than only
+    in the Actions log. Returns {"ok_count": int, "total": int,
+    "failures": [label, ...]}.
+    """
+    checks = []
+    for name, info in details.items():
+        checks.append((f"Vàng - {name}", "error" not in info))
+    checks.append(("Bạc - tổng hợp", "rows" in silver))
+    for brand, info in silver_details.items():
+        if brand in SILVER_DETAIL_PAGES:  # only check brands with an actual dedicated page to fetch
+            checks.append((f"Bạc - {brand} (chi tiết)", info.get("source") is not None))
+    checks.append(("Giá vàng thế giới", "data" in world_gold))
+    checks.append(("Tỷ giá Vietcombank", "data" in vcb_rate))
+
+    ok_count = sum(1 for _, ok in checks if ok)
+    failures = [name for name, ok in checks if not ok]
+    return {"ok_count": ok_count, "total": len(checks), "failures": failures}
+
+
 def fetch_summary():
     """Fetch + parse the homepage comparison tables (one row per seller)."""
     html = fetch_page(SOURCE_URL)
@@ -895,8 +1099,8 @@ CARD_STYLE = (
 
 def _card(icon, title, accent, body_html):
     return f"""
-    <div style="{CARD_STYLE}">
-      <p style="margin:0;font-size:16.5px;font-weight:700;color:#111827;font-family:{FONT_STACK};">
+    <div class="dm-card" style="{CARD_STYLE}">
+      <p class="dm-text" style="margin:0;font-size:16.5px;font-weight:700;color:#111827;font-family:{FONT_STACK};">
         <span style="font-size:19px;margin-right:6px;">{icon}</span>{escape(title)}
       </p>
       <div style="height:3px;width:42px;background:{accent};border-radius:2px;margin:8px 0 16px;"></div>
@@ -1098,8 +1302,101 @@ def _big_moves_html(moves):
     return _table_open(["Sản phẩm", "Giai đoạn", "Biến động"], ["left", "left", "right"], COLOR_RED_TINT) + body + _TABLE_CLOSE
 
 
+def _vcb_rate_html(vcb_rate):
+    if "error" in vcb_rate:
+        return (
+            f"<p style='color:{COLOR_MUTED};font-size:12px;margin:8px 0 0;'>Không lấy được tỷ giá VCB thực tế lần này "
+            f"({escape(vcb_rate['error'])}). Xem tại <a href='{escape(vcb_rate['url'])}'>{escape(vcb_rate['url'])}</a>.</p>"
+        )
+    d = vcb_rate["data"]
+    return (
+        f"<p style='font-size:13px;color:{COLOR_MUTED};margin:8px 0 0;'>Tỷ giá USD/VND thực tế (Vietcombank): "
+        f"<strong style='color:{COLOR_TEXT}'>mua {_format_vnd(d['buy'])} / bán {_format_vnd(d['sell'])}</strong> đồng"
+        + (f" &middot; chuyển khoản {_format_vnd(d['transfer'])} đồng" if d.get("transfer") else "")
+        + "</p>"
+    )
+
+
+def _extremes_html(extremes):
+    if not extremes:
+        return f"<p style='color:{COLOR_MUTED};font-size:13px;margin:0;'>Chưa có mục nào đang ở mức cao/thấp nhất trong 30/90 ngày qua (hoặc chưa đủ lịch sử để so sánh).</p>"
+
+    def _row(i, e):
+        is_high = e["kind"] == "high"
+        color = COLOR_UP if is_high else COLOR_DOWN
+        icon = "🔺" if is_high else "🔻"
+        label_vi = "Cao nhất" if is_high else "Thấp nhất"
+        return (
+            f"<tr style='background:{_tr_bg(i)}'>"
+            f"<td style='{_TD}'>{escape(e['label'])}</td>"
+            f"<td style='{_TD}'>{escape(e['period'])}</td>"
+            f"<td style='{_TD}text-align:right;color:{color};font-weight:700;'>{icon} {label_vi}: {_format_vnd(e['value'])}</td>"
+            "</tr>"
+        )
+
+    body = "".join(_row(i, e) for i, e in enumerate(extremes))
+    return _table_open(["Sản phẩm", "Giai đoạn", "Mức"], ["left", "left", "right"], COLOR_BLUE_TINT) + body + _TABLE_CLOSE
+
+
+def _holdings_html(portfolio):
+    if not portfolio["items"]:
+        return (
+            f"<p style='color:{COLOR_MUTED};font-size:13px;margin:0;'>Chưa cấu hình danh mục. Đặt biến môi trường "
+            "<code>HOLDINGS_JSON</code> để hiển thị giá trị và lãi/lỗ danh mục của bạn ở đây - xem README.</p>"
+        )
+
+    def _row(i, h):
+        if not h.get("matched"):
+            return (
+                f"<tr style='background:{_tr_bg(i)}'>"
+                f"<td style='{_TD}'>{escape(h['label'])}</td>"
+                f"<td colspan='4' style='{_TD}color:{COLOR_MUTED};font-size:12px;'>Không khớp được với dữ liệu giá hiện tại</td>"
+                "</tr>"
+            )
+        color = COLOR_UP if h["gain"] > 0 else (COLOR_DOWN if h["gain"] < 0 else COLOR_FLAT)
+        sign = "+" if h["gain"] >= 0 else ""
+        pct_str = f" ({sign}{h['gain_pct']:.2f}%)" if h["gain_pct"] is not None else ""
+        return (
+            f"<tr style='background:{_tr_bg(i)}'>"
+            f"<td style='{_TD}'>{escape(h['label'])}</td>"
+            f"<td style='{_TD}text-align:right;'>{h['amount']:g}</td>"
+            f"<td style='{_TD}text-align:right;'>{_format_vnd(h['value'])}</td>"
+            f"<td style='{_TD}text-align:right;color:{color};font-weight:700;'>{sign}{_format_vnd(h['gain'])}{pct_str}</td>"
+            "</tr>"
+        )
+
+    body = "".join(_row(i, h) for i, h in enumerate(portfolio["items"]))
+    table = _table_open(["Sản phẩm", "Số lượng", "Giá trị hiện tại", "Lãi/Lỗ"], ["left", "right", "right", "right"], COLOR_GOLD_TINT) + body + _TABLE_CLOSE
+
+    total_color = COLOR_UP if portfolio["total_gain"] > 0 else (COLOR_DOWN if portfolio["total_gain"] < 0 else COLOR_FLAT)
+    total_sign = "+" if portfolio["total_gain"] >= 0 else ""
+    total_pct = (portfolio["total_gain"] / portfolio["total_cost"] * 100) if portfolio["total_cost"] else None
+    summary = (
+        f"<p style='font-size:15px;margin:14px 0 0;'>Tổng giá trị: <strong>{_format_vnd(portfolio['total_value'])} đ</strong>"
+        f" &middot; Lãi/Lỗ: <strong style='color:{total_color}'>{total_sign}{_format_vnd(portfolio['total_gain'])} đ"
+        + (f" ({total_sign}{total_pct:.2f}%)" if total_pct is not None else "")
+        + "</strong></p>"
+    )
+    return table + summary
+
+
+def _source_health_banner(health):
+    all_ok = health["ok_count"] == health["total"]
+    color = COLOR_GREEN_ACCENT if all_ok else COLOR_RED_ACCENT
+    bg = COLOR_GREEN_TINT if all_ok else COLOR_RED_TINT
+    icon = "✅" if all_ok else "⚠️"
+    text = f"{icon} {health['ok_count']}/{health['total']} nguồn dữ liệu OK"
+    if health["failures"]:
+        text += " &middot; Lỗi: " + ", ".join(escape(f) for f in health["failures"])
+    return (
+        f"<div style='background:{bg};border-radius:10px;padding:10px 16px;margin:0 0 18px;'>"
+        f"<p style='margin:0;font-size:12.5px;color:{color};font-weight:600;'>{text}</p>"
+        "</div>"
+    )
+
+
 def build_html(summary_tables, details, silver, silver_details, price_changes, world_gold, gap_rows,
-                spreads, big_moves, has_chart, source_url, timestamp):
+                spreads, big_moves, has_chart, vcb_rate, extremes, portfolio, source_health, source_url, timestamp):
     # --- Section 1: summary comparison ---
     if not summary_tables:
         summary_html = (
@@ -1168,8 +1465,8 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
         "từ lần đầu email này chạy - có thể chưa đủ dữ liệu cho mốc 30 ngày/1 năm ngay từ đầu, sẽ đầy đủ dần theo thời gian.</p>"
     )
 
-    # --- Section 6: world gold price + domestic-world gap ---
-    world_html = _world_gold_html(world_gold, gap_rows)
+    # --- Section 6: world gold price + domestic-world gap + VCB rate ---
+    world_html = _world_gold_html(world_gold, gap_rows) + _vcb_rate_html(vcb_rate)
 
     # --- Section 7: buy/sell spread ---
     spread_parts = []
@@ -1194,6 +1491,12 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
         f"<p style='color:{COLOR_MUTED};font-size:13px;'>Chưa đủ dữ liệu để vẽ biểu đồ (cần ít nhất 2 ngày lịch sử) - sẽ xuất hiện khi có thêm dữ liệu.</p>"
     )
 
+    # --- Section 10: 30/90-day extremes ---
+    extremes_html = _extremes_html(extremes)
+
+    # --- Section 11: your portfolio ---
+    holdings_html = _holdings_html(portfolio)
+
     # --- Hero stat chips (SJC now, world price, alert count) ---
     sjc_sell = next(
         (r["sell"] for r in (summary_tables[0] if summary_tables else []) if r["label"] == "SJC"),
@@ -1209,10 +1512,24 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
         + _stat_chip("Biến động lớn", str(len(big_moves)), f"≥ {ALERT_THRESHOLD_PCT:.0f}% ghi nhận", moves_color)
     )
 
+    health_banner = _source_health_banner(source_health)
+
     return f"""\
 <html>
+  <head>
+    <meta name="color-scheme" content="light dark">
+    <meta name="supported-color-schemes" content="light dark">
+    <style>
+      @media (prefers-color-scheme: dark) {{
+        .dm-bg {{ background:#0f1115 !important; }}
+        .dm-card {{ background:#1a1d24 !important; border-color:#2a2e37 !important; }}
+        .dm-text {{ color:#f3f4f6 !important; }}
+        .dm-muted {{ color:#9aa1ab !important; }}
+      }}
+    </style>
+  </head>
   <body style="margin:0;padding:0;background:#eef1f5;font-family:{FONT_STACK};">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="dm-bg" style="background:#eef1f5;">
       <tr>
         <td align="center" style="padding:24px 12px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;">
@@ -1227,29 +1544,34 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
 
             <!-- Hero stat chips -->
             <tr>
-              <td style="background:#ffffff;border-left:1px solid {COLOR_BORDER};border-right:1px solid {COLOR_BORDER};padding:14px 16px 4px;">
+              <td class="dm-card" style="background:#ffffff;border-left:1px solid {COLOR_BORDER};border-right:1px solid {COLOR_BORDER};padding:14px 16px 4px;">
                 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>{chips}</tr></table>
               </td>
             </tr>
-            <tr><td style="background:#ffffff;border-left:1px solid {COLOR_BORDER};border-right:1px solid {COLOR_BORDER};border-bottom:1px solid {COLOR_BORDER};border-radius:0 0 16px 16px;padding:0 0 18px;"></td></tr>
+            <tr><td class="dm-card" style="background:#ffffff;border-left:1px solid {COLOR_BORDER};border-right:1px solid {COLOR_BORDER};border-bottom:1px solid {COLOR_BORDER};border-radius:0 0 16px 16px;padding:0 0 18px;"></td></tr>
 
             <tr><td style="height:20px;"></td></tr>
+
+            <tr><td style="padding:0 6px;">{health_banner}</td></tr>
 
             <tr><td>{_card("🥇", "Vàng - Tổng hợp so sánh giữa các đơn vị", COLOR_GOLD, summary_html)}</td></tr>
             <tr><td>{_card("📋", "Vàng - Chi tiết đầy đủ theo từng đơn vị", COLOR_GOLD, detail_html)}</td></tr>
             <tr><td>{_card("🥈", "Bạc - So sánh giữa các đơn vị", COLOR_SILVER, silver_html)}</td></tr>
             <tr><td>{_card("📋", "Bạc - Chi tiết đầy đủ theo từng đơn vị", COLOR_SILVER, silver_detail_html)}</td></tr>
             <tr><td>{_card("📊", "Biến động giá (7 ngày / 30 ngày / 1 năm)", COLOR_BLUE, changes_html)}</td></tr>
+            <tr><td>{_card("🔺", "Cực trị 30/90 ngày", COLOR_BLUE, extremes_html)}</td></tr>
             <tr><td>{_card("🌍", "Giá vàng thế giới & chênh lệch trong nước/thế giới", COLOR_GREEN_ACCENT, world_html)}</td></tr>
             <tr><td>{_card("↔️", "Chênh lệch mua-bán (spread)", COLOR_BLUE, spread_html)}</td></tr>
             <tr><td>{_card("🚨", f"Cảnh báo biến động lớn (≥ {ALERT_THRESHOLD_PCT:.1f}%)", COLOR_RED_ACCENT, big_moves_html)}</td></tr>
+            <tr><td>{_card("💼", "Danh mục của bạn", COLOR_GOLD, holdings_html)}</td></tr>
             <tr><td>{_card("📈", "Biểu đồ xu hướng giá", COLOR_TEXT, chart_html)}</td></tr>
 
             <tr>
               <td style="padding:8px 6px 0;">
-                <p style="color:{COLOR_MUTED};font-size:11.5px;line-height:1.6;margin:0;">
+                <p class="dm-muted" style="color:{COLOR_MUTED};font-size:11.5px;line-height:1.6;margin:0;">
                   Nguồn: <a href="{escape(source_url)}" style="color:{COLOR_BLUE};">{escape(source_url)}</a> (vàng),
-                  <a href="{escape(SILVER_URL)}" style="color:{COLOR_BLUE};">{escape(SILVER_URL)}</a> (bạc) &middot;
+                  <a href="{escape(SILVER_URL)}" style="color:{COLOR_BLUE};">{escape(SILVER_URL)}</a> (bạc),
+                  <a href="{escape(VCB_RATE_URL)}" style="color:{COLOR_BLUE};">{escape(VCB_RATE_URL)}</a> (tỷ giá) &middot;
                   Đơn vị: nghìn đồng/lượng trừ khi ghi chú khác trên trang gốc &middot;
                   Email tự động, chỉ mang tính tham khảo, không phải lời khuyên đầu tư.
                 </p>
@@ -1267,8 +1589,14 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
 
 
 def build_plain_text(summary_tables, details, silver, silver_details, price_changes, world_gold, gap_rows,
-                      spreads, big_moves, has_chart, source_url, timestamp):
-    lines = [f"Gia vang & bac hom nay - cap nhat {timestamp}", "", "== VANG - TONG HOP =="]
+                      spreads, big_moves, has_chart, vcb_rate, extremes, portfolio, source_health,
+                      source_url, timestamp):
+    lines = [
+        f"Gia vang & bac hom nay - cap nhat {timestamp}",
+        f"Tinh trang nguon: {source_health['ok_count']}/{source_health['total']} OK"
+        + (f" - loi: {', '.join(source_health['failures'])}" if source_health["failures"] else ""),
+        "", "== VANG - TONG HOP ==",
+    ]
     if not summary_tables:
         lines.append("Could not parse the summary comparison table this run.")
     else:
@@ -1354,6 +1682,17 @@ def build_plain_text(summary_tables, details, silver, silver_details, price_chan
             lines.append("  Chenh lech trong nuoc vs the gioi:")
             for r in gap_rows:
                 lines.append(f"    {r['label']}: {'+' if r['gap'] >= 0 else ''}{r['gap']:,}".replace(",", ".") + " d")
+    if "data" in vcb_rate:
+        d = vcb_rate["data"]
+        lines.append(f"  Ty gia VCB thuc te: mua {d['buy']:,} / ban {d['sell']:,}".replace(",", ".") + " d")
+
+    lines.append("")
+    lines.append("== CUC TRI 30/90 NGAY ==")
+    if not extremes:
+        lines.append("  Chua co muc cao/thap nhat dang chu y.")
+    else:
+        for e in extremes:
+            lines.append(f"  {e['label']} ({e['period']}): {'CAO NHAT' if e['kind'] == 'high' else 'THAP NHAT'} {e['value']:,}".replace(",", "."))
 
     lines.append("")
     lines.append("== CHENH LECH MUA-BAN (SPREAD) ==")
@@ -1383,6 +1722,26 @@ def build_plain_text(summary_tables, details, silver, silver_details, price_chan
     lines.append("")
     lines.append("== BIEU DO XU HUONG GIA ==")
     lines.append("  Xem bieu do trong email HTML." if has_chart else "  Chua du du lieu de ve bieu do.")
+
+    lines.append("")
+    lines.append("== DANH MUC CUA BAN ==")
+    if not portfolio["items"]:
+        lines.append("  Chua cau hinh (dat HOLDINGS_JSON).")
+    else:
+        for h in portfolio["items"]:
+            if not h.get("matched"):
+                lines.append(f"  {h['label']}: khong khop duoc voi du lieu gia hien tai")
+                continue
+            sign = "+" if h["gain"] >= 0 else ""
+            pct = f" ({sign}{h['gain_pct']:.2f}%)" if h["gain_pct"] is not None else ""
+            lines.append(
+                f"  {h['label']} x{h['amount']:g}: gia tri {h['value']:,}".replace(",", ".")
+                + f" d, lai/lo {sign}{h['gain']:,}".replace(",", ".") + pct
+            )
+        lines.append(
+            f"  TONG: gia tri {portfolio['total_value']:,}".replace(",", ".")
+            + f" d, lai/lo {'+' if portfolio['total_gain'] >= 0 else ''}{portfolio['total_gain']:,}".replace(",", ".") + " d"
+        )
 
     return "\n".join(lines)
 
@@ -1451,9 +1810,25 @@ def cmd_generate():
     print("World gold: OK." if "data" in world_gold else f"World gold: failed ({world_gold['error']}).")
     gap_rows = compute_domestic_world_gap(summary_tables, world_gold)
 
+    print(f"Fetching Vietcombank USD rate {VCB_RATE_URL} ...")
+    vcb_rate = fetch_vcb_rate()
+    print("VCB rate: OK." if "data" in vcb_rate else f"VCB rate: failed ({vcb_rate['error']}).")
+
     spreads = compute_spreads(summary_tables, silver.get("rows", []))
-    big_moves = compute_big_moves(price_changes)
-    print(f"Big moves: {len(big_moves)} item(s) at or above {ALERT_THRESHOLD_PCT:.1f}%.")
+    big_moves = compute_big_moves(
+        price_changes, threshold_pct=ALERT_THRESHOLD_PCT,
+        watchlist=WATCHLIST, thresholds_override=ALERT_THRESHOLDS_OVERRIDE,
+    )
+    print(f"Big moves: {len(big_moves)} item(s) flagged" + (f" (watchlist: {', '.join(WATCHLIST)})" if WATCHLIST else "") + ".")
+
+    extremes = compute_extremes(history, today_str, today_snapshot)
+    print(f"Extremes: {len(extremes)} item(s) at a 30/90-day high or low.")
+
+    portfolio = compute_holdings(HOLDINGS, summary_tables, silver.get("rows", []))
+    print(f"Portfolio: {len(portfolio['items'])} holding(s) configured.")
+
+    source_health = compute_source_health(details, silver, silver_details, world_gold, vcb_rate)
+    print(f"Source health: {source_health['ok_count']}/{source_health['total']} OK.")
 
     chart_path = os.path.join(EMAIL_DIR, "chart.png")
     try:
@@ -1471,6 +1846,8 @@ def cmd_generate():
         "price_changes": price_changes,
         "world_gold": world_gold,
         "spreads": spreads,
+        "vcb_rate": vcb_rate,
+        "portfolio": portfolio,
     }
     price_hash = hash_data(combined)
     last_hash = load_last_hash()
@@ -1484,11 +1861,13 @@ def cmd_generate():
     subject = f"Gia vang & bac hom nay - {now.strftime('%d/%m/%Y %H:%M')}"
     html_body = build_html(
         summary_tables, details, silver, silver_details, price_changes,
-        world_gold, gap_rows, spreads, big_moves, has_chart, SOURCE_URL, timestamp,
+        world_gold, gap_rows, spreads, big_moves, has_chart,
+        vcb_rate, extremes, portfolio, source_health, SOURCE_URL, timestamp,
     )
     text_body = build_plain_text(
         summary_tables, details, silver, silver_details, price_changes,
-        world_gold, gap_rows, spreads, big_moves, has_chart, SOURCE_URL, timestamp,
+        world_gold, gap_rows, spreads, big_moves, has_chart,
+        vcb_rate, extremes, portfolio, source_health, SOURCE_URL, timestamp,
     )
 
     with open(os.path.join(EMAIL_DIR, "subject.txt"), "w") as f:
@@ -1509,7 +1888,11 @@ def cmd_generate():
                 "silver_detail_rows": silver_detail_count,
                 "changes_count": changes_count,
                 "world_gold_ok": "data" in world_gold,
+                "vcb_rate_ok": "data" in vcb_rate,
                 "big_moves_count": len(big_moves),
+                "extremes_count": len(extremes),
+                "portfolio_items": len(portfolio["items"]),
+                "source_health": source_health,
                 "has_chart": has_chart,
             },
             f,
@@ -1521,8 +1904,241 @@ def cmd_generate():
     print(
         f"Generated email ({summary_rows} summary rows, {detail_rows} detail rows, "
         f"{silver_rows} silver rows, {silver_detail_count} silver detail rows, "
-        f"{changes_count} change rows, {len(big_moves)} big moves). Saved to ./{EMAIL_DIR}/"
+        f"{changes_count} change rows, {len(big_moves)} big moves, {len(extremes)} extremes). "
+        f"Saved to ./{EMAIL_DIR}/"
     )
+
+
+RECAP_DIR = "email_recap"
+RECAP_PERIOD_DAYS = {"weekly": 7, "monthly": 30}
+
+
+def compute_recap_stats(history, period_days, today_str):
+    """
+    For each gold-summary and silver-summary item, compute start/end/high/
+    low/net-change over the trailing period_days, using whatever daily
+    snapshots exist in that window. Items with fewer than 2 data points
+    in the window are skipped (nothing meaningful to summarize).
+    Returns {"gold": [...], "silver": [...]}.
+    """
+    cutoff = (datetime.strptime(today_str, "%Y-%m-%d") - _timedelta(days=period_days)).strftime("%Y-%m-%d")
+    dates_in_range = sorted(d for d in history if cutoff <= d <= today_str)
+
+    gold_keys, silver_keys = set(), set()
+    for d in dates_in_range:
+        for tk, items in history[d].get("gold", {}).items():
+            gold_keys.update((tk, lb) for lb in items)
+        silver_keys.update(history[d].get("silver", {}).keys())
+
+    def _stats_for(values):
+        values = [v for v in values if v is not None]
+        if len(values) < 2:
+            return None
+        start, end = values[0], values[-1]
+        return {
+            "start": start, "end": end, "high": max(values), "low": min(values),
+            "change": end - start, "change_pct": (end - start) / start * 100 if start else None,
+        }
+
+    gold_stats = []
+    for tk, lb in sorted(gold_keys):
+        s = _stats_for([history[d].get("gold", {}).get(tk, {}).get(lb) for d in dates_in_range])
+        if s:
+            gold_stats.append({"label": lb, **s})
+
+    silver_stats = []
+    for k in sorted(silver_keys):
+        s = _stats_for([history[d].get("silver", {}).get(k) for d in dates_in_range])
+        if s:
+            silver_stats.append({"label": k, **s})
+
+    return {"gold": gold_stats, "silver": silver_stats}
+
+
+def history_to_csv(history):
+    import csv
+    import io
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["date", "category", "table_key", "label", "sell_price_vnd"])
+    for date_str in sorted(history):
+        snap = history[date_str]
+        for table_key, items in snap.get("gold", {}).items():
+            for label, price in items.items():
+                writer.writerow([date_str, "gold", table_key, label, price])
+        for label, price in snap.get("silver", {}).items():
+            writer.writerow([date_str, "silver", "", label, price])
+    return out.getvalue()
+
+
+def _recap_table_html(rows, label_header):
+    def _row(i, r):
+        color = COLOR_UP if r["change"] > 0 else (COLOR_DOWN if r["change"] < 0 else COLOR_FLAT)
+        sign = "+" if r["change"] >= 0 else ""
+        pct = f" ({sign}{r['change_pct']:.2f}%)" if r["change_pct"] is not None else ""
+        return (
+            f"<tr style='background:{_tr_bg(i)}'>"
+            f"<td style='{_TD}'>{escape(r['label'])}</td>"
+            f"<td style='{_TD}text-align:right;'>{_format_vnd(r['low'])}</td>"
+            f"<td style='{_TD}text-align:right;'>{_format_vnd(r['high'])}</td>"
+            f"<td style='{_TD}text-align:right;color:{color};font-weight:700;'>{sign}{_format_vnd(r['change'])}{pct}</td>"
+            "</tr>"
+        )
+
+    body = "".join(_row(i, r) for i, r in enumerate(rows))
+    return _table_open([label_header, "Thấp nhất", "Cao nhất", "Thay đổi"], ["left", "right", "right", "right"], COLOR_BLUE_TINT) + body + _TABLE_CLOSE
+
+
+def build_recap_html(stats, period_label_vi, period_days, timestamp):
+    gold_html = _recap_table_html(stats["gold"], "Vàng (SJC, PNJ, ...)") if stats["gold"] else \
+        f"<p style='color:{COLOR_MUTED};font-size:13px;'>Chưa đủ dữ liệu cho giai đoạn này.</p>"
+    silver_html = _recap_table_html(stats["silver"], "Bạc") if stats["silver"] else \
+        f"<p style='color:{COLOR_MUTED};font-size:13px;'>Chưa đủ dữ liệu cho giai đoạn này.</p>"
+
+    return f"""\
+<html>
+  <body style="margin:0;padding:0;background:#eef1f5;font-family:{FONT_STACK};">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;">
+      <tr>
+        <td align="center" style="padding:24px 12px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;">
+            <tr>
+              <td style="background:linear-gradient(135deg,#2f3b52,#4a5b7a);border-radius:16px;padding:26px 28px;">
+                <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">📅 Tổng kết giá {escape(period_label_vi)}</p>
+                <p style="margin:6px 0 0;font-size:13px;color:#dfe4ee;">{period_days} ngày qua &middot; Tính đến {escape(timestamp)}</p>
+              </td>
+            </tr>
+            <tr><td style="height:20px;"></td></tr>
+            <tr><td>{_card("🥇", "Vàng", COLOR_GOLD, gold_html)}</td></tr>
+            <tr><td>{_card("🥈", "Bạc", COLOR_SILVER, silver_html)}</td></tr>
+            <tr>
+              <td style="padding:8px 6px 0;">
+                <p style="color:{COLOR_MUTED};font-size:11.5px;line-height:1.6;margin:0;">
+                  Đính kèm: toàn bộ lịch sử giá đã ghi nhận (CSV) &middot;
+                  Email tự động, chỉ mang tính tham khảo, không phải lời khuyên đầu tư.
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+
+
+def build_recap_text(stats, period_label_vi, period_days, timestamp):
+    lines = [f"Tong ket gia {period_label_vi} - {period_days} ngay qua - tinh den {timestamp}", "", "== VANG =="]
+    if not stats["gold"]:
+        lines.append("  Chua du du lieu.")
+    else:
+        for r in stats["gold"]:
+            sign = "+" if r["change"] >= 0 else ""
+            pct = f" ({sign}{r['change_pct']:.2f}%)" if r["change_pct"] is not None else ""
+            lines.append(f"  {r['label']}: thap {r['low']:,} / cao {r['high']:,} / thay doi {sign}{r['change']:,}{pct}".replace(",", "."))
+    lines.append("")
+    lines.append("== BAC ==")
+    if not stats["silver"]:
+        lines.append("  Chua du du lieu.")
+    else:
+        for r in stats["silver"]:
+            sign = "+" if r["change"] >= 0 else ""
+            pct = f" ({sign}{r['change_pct']:.2f}%)" if r["change_pct"] is not None else ""
+            lines.append(f"  {r['label']}: thap {r['low']:,} / cao {r['high']:,} / thay doi {sign}{r['change']:,}{pct}".replace(",", "."))
+    lines.append("")
+    lines.append("Dinh kem: toan bo lich su gia da ghi nhan (CSV).")
+    return "\n".join(lines)
+
+
+def cmd_recap_generate(period):
+    if period not in RECAP_PERIOD_DAYS:
+        print(f"Unknown recap period '{period}' - use 'weekly' or 'monthly'.", file=sys.stderr)
+        sys.exit(1)
+    period_days = RECAP_PERIOD_DAYS[period]
+    period_label_vi = "tuần" if period == "weekly" else "tháng"
+
+    if os.path.exists(RECAP_DIR):
+        for f in os.listdir(RECAP_DIR):
+            os.remove(os.path.join(RECAP_DIR, f))
+    os.makedirs(RECAP_DIR, exist_ok=True)
+
+    history = load_history()
+    now, timestamp = resolve_timestamp()
+    today_str = now.strftime("%Y-%m-%d")
+    stats = compute_recap_stats(history, period_days, today_str)
+    print(f"Recap ({period}): {len(stats['gold'])} gold item(s), {len(stats['silver'])} silver item(s), {len(history)} day(s) of history available.")
+
+    subject = f"Tong ket gia vang & bac {period_label_vi} - {now.strftime('%d/%m/%Y')}"
+    html_body = build_recap_html(stats, period_label_vi, period_days, timestamp)
+    text_body = build_recap_text(stats, period_label_vi, period_days, timestamp)
+    csv_data = history_to_csv(history)
+
+    with open(os.path.join(RECAP_DIR, "subject.txt"), "w") as f:
+        f.write(subject)
+    with open(os.path.join(RECAP_DIR, "body.html"), "w") as f:
+        f.write(html_body)
+    with open(os.path.join(RECAP_DIR, "body.txt"), "w") as f:
+        f.write(text_body)
+    with open(os.path.join(RECAP_DIR, "history.csv"), "w") as f:
+        f.write(csv_data)
+    with open(os.path.join(RECAP_DIR, "meta.json"), "w") as f:
+        json.dump({"send": True, "gold_items": len(stats["gold"]), "silver_items": len(stats["silver"])}, f)
+
+    print(f"Generated recap email. Saved to ./{RECAP_DIR}/")
+
+
+def cmd_recap_send():
+    sender = os.environ.get("GMAIL_ADDRESS")
+    app_password = os.environ.get("GMAIL_APP_PASSWORD")
+    recipient = os.environ.get("GOLD_RECIPIENT")
+
+    missing = [name for name, val in [
+        ("GMAIL_ADDRESS", sender), ("GMAIL_APP_PASSWORD", app_password), ("GOLD_RECIPIENT", recipient),
+    ] if not val]
+    if missing:
+        print(f"Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+    meta_path = os.path.join(RECAP_DIR, "meta.json")
+    if not os.path.exists(meta_path):
+        print("No meta.json found - run 'recap-generate' first.", file=sys.stderr)
+        sys.exit(1)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    if not meta.get("send", False):
+        print("Nothing to send.")
+        return
+
+    with open(os.path.join(RECAP_DIR, "subject.txt")) as f:
+        subject = f.read()
+    with open(os.path.join(RECAP_DIR, "body.html")) as f:
+        html_body = f.read()
+    with open(os.path.join(RECAP_DIR, "body.txt")) as f:
+        text_body = f.read()
+
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(text_body, "plain"))
+    alt.attach(MIMEText(html_body, "html"))
+    msg.attach(alt)
+
+    csv_path = os.path.join(RECAP_DIR, "history.csv")
+    if os.path.exists(csv_path):
+        with open(csv_path, "rb") as f:
+            attachment = MIMEApplication(f.read(), _subtype="csv")
+        attachment.add_header("Content-Disposition", "attachment", filename="gold_silver_price_history.csv")
+        msg.attach(attachment)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(sender, app_password)
+        server.send_message(msg)
+
+    print(f"Sent recap to {recipient}!")
 
 
 def cmd_send():
@@ -1587,14 +2203,26 @@ def cmd_send():
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("generate", "send"):
-        print("Usage: python gold_price_emailer.py [generate|send]", file=sys.stderr)
+    usage = "Usage: python gold_price_emailer.py [generate|send|recap-generate weekly|monthly|recap-send]"
+    if len(sys.argv) < 2:
+        print(usage, file=sys.stderr)
         sys.exit(1)
 
-    if sys.argv[1] == "generate":
+    cmd = sys.argv[1]
+    if cmd == "generate":
         cmd_generate()
-    else:
+    elif cmd == "send":
         cmd_send()
+    elif cmd == "recap-generate":
+        if len(sys.argv) != 3:
+            print(usage, file=sys.stderr)
+            sys.exit(1)
+        cmd_recap_generate(sys.argv[2])
+    elif cmd == "recap-send":
+        cmd_recap_send()
+    else:
+        print(usage, file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
