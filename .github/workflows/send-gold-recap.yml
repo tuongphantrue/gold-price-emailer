@@ -1,0 +1,63 @@
+name: Send Gold Recap
+on:
+  schedule:
+    - cron: "0 0 * * 1"    # every Monday 00:00 UTC -> weekly recap
+    - cron: "0 0 1 * *"    # 1st of the month 00:00 UTC -> monthly recap
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "Recap period for a manual run"
+        required: false
+        default: "weekly"
+        type: choice
+        options: ["weekly", "monthly"]
+permissions:
+  contents: read
+jobs:
+  send-gold-recap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip certifi
+          pip install -r requirements.txt
+      - name: Determine recap period
+        id: period
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 0 1 * *" ]; then
+            echo "period=monthly" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 0 * * 1" ]; then
+            echo "period=weekly" >> "$GITHUB_OUTPUT"
+          else
+            echo "period=${{ github.event.inputs.period || 'weekly' }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fetch price history (read-only - this workflow doesn't write state)
+        run: |
+          mkdir -p state
+          if git ls-remote --exit-code --heads origin gold-price-state >/dev/null 2>&1; then
+            git fetch --depth 1 origin gold-price-state
+            if git show origin/gold-price-state:state/price_history.json > state/price_history.json 2>/dev/null; then
+              echo "Loaded price history."
+            else
+              echo "No state/price_history.json found on gold-price-state branch yet."
+            fi
+          else
+            echo "gold-price-state branch doesn't exist yet - the main Send Gold Price workflow needs to have run at least once first."
+          fi
+      - name: Generate recap email
+        env:
+          TIMEZONE: "Asia/Ho_Chi_Minh"
+          PRICE_HISTORY_FILE: "state/price_history.json"
+        run: python gold_price_emailer.py recap-generate ${{ steps.period.outputs.period }}
+      - name: Send recap email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GOLD_RECIPIENT: ${{ secrets.GOLD_RECIPIENT }}
+        run: python gold_price_emailer.py recap-send
