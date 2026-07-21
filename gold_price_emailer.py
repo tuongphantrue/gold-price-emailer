@@ -692,6 +692,21 @@ def parse_world_gold(html):
     return result
 
 
+def _leading_grouped_number(s):
+    """
+    Extract a properly comma-grouped number from the start of a string,
+    e.g. '26,080' from '26,08030' - the source site appends a same-day
+    change indicator directly after the rate with no separating space or
+    tag boundary (confirmed on the live page: cells read like
+    '26,08030' where '26,080' is the rate and '30' is the change badge),
+    so a blind "strip all non-digits" would merge them into a wrong
+    number. Requiring at least one comma-group means the un-grouped
+    trailing digits never get included. Returns None if nothing matches.
+    """
+    m = re.match(r"\s*(\d{1,3}(?:,\d{3})+)", s or "")
+    return m.group(1) if m else None
+
+
 def parse_vcb_rate(html):
     """
     Parse tygiausd.org's Vietcombank rate table for the USD row. Returns
@@ -709,7 +724,9 @@ def parse_vcb_rate(html):
         for tr in table.find_all("tr")[1:]:
             cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
             if len(cells) >= 5 and cells[0] == "USD":
-                buy, transfer, sell = _parse_vnd_number(cells[2]), _parse_vnd_number(cells[3]), _parse_vnd_number(cells[4])
+                buy = _parse_vnd_number(_leading_grouped_number(cells[2]))
+                transfer = _parse_vnd_number(_leading_grouped_number(cells[3]))
+                sell = _parse_vnd_number(_leading_grouped_number(cells[4]))
                 if sell is not None:
                     return {"buy": buy, "transfer": transfer, "sell": sell}
     return None
