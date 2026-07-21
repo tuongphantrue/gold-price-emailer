@@ -22,7 +22,7 @@ jobs:
         run: |
           pip install --upgrade pip certifi
           pip install -r requirements.txt
-      - name: Fetch previous dedup state
+      - name: Fetch previous state (dedup + price history)
         run: |
           mkdir -p state
           if git ls-remote --exit-code --heads origin gold-price-state >/dev/null 2>&1; then
@@ -33,6 +33,12 @@ jobs:
               echo "No state/last_price.json on gold-price-state branch yet, starting fresh."
               rm -f state/last_price.json
             fi
+            if git show origin/gold-price-state:state/price_history.json > state/price_history.json 2>/dev/null; then
+              echo "Loaded existing price history."
+            else
+              echo "No state/price_history.json on gold-price-state branch yet, starting fresh."
+              rm -f state/price_history.json
+            fi
           else
             echo "gold-price-state branch doesn't exist yet, starting fresh."
           fi
@@ -40,17 +46,22 @@ jobs:
         env:
           TIMEZONE: "Asia/Ho_Chi_Minh"
           STATE_FILE: "state/last_price.json"
+          PRICE_HISTORY_FILE: "state/price_history.json"
           SEND_ONLY_ON_CHANGE: "false"
           # Last-resort opt-in if you hit a certificate verification error
           # in this step - see README's SSL troubleshooting section before
           # enabling. Set the ALLOW_INSECURE_SSL_FALLBACK repo secret to
           # "true" to activate; leave it unset/false otherwise.
           ALLOW_INSECURE_SSL_FALLBACK: ${{ secrets.ALLOW_INSECURE_SSL_FALLBACK }}
+          # All optional - safe to leave unset. See README for format.
+          WATCHLIST: ${{ secrets.WATCHLIST }}
+          ALERT_THRESHOLDS_JSON: ${{ secrets.ALERT_THRESHOLDS_JSON }}
+          HOLDINGS_JSON: ${{ secrets.HOLDINGS_JSON }}
         run: python gold_price_emailer.py generate
-      - name: Publish updated dedup state
+      - name: Publish updated state (dedup + price history)
         run: |
-          if [ ! -f state/last_price.json ]; then
-            echo "No state file produced, skipping publish step."
+          if [ ! -f state/last_price.json ] && [ ! -f state/price_history.json ]; then
+            echo "No state files produced, skipping publish step."
             exit 0
           fi
           rm -rf /tmp/state-repo
@@ -61,9 +72,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -q -b gold-price-state
           mkdir -p state
-          cp "$GITHUB_WORKSPACE/state/last_price.json" state/last_price.json
+          [ -f "$GITHUB_WORKSPACE/state/last_price.json" ] && cp "$GITHUB_WORKSPACE/state/last_price.json" state/last_price.json
+          [ -f "$GITHUB_WORKSPACE/state/price_history.json" ] && cp "$GITHUB_WORKSPACE/state/price_history.json" state/price_history.json
           git add -A
-          git commit -q -m "Update gold price dedup state - $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git commit -q -m "Update gold price state - $(date -u +'%Y-%m-%d %H:%M UTC')"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push -q --force origin gold-price-state
       - name: Send email
