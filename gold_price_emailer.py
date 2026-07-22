@@ -1084,6 +1084,17 @@ def fetch_summary():
     return parse_comparison_tables(html)
 
 
+def _looks_like_silver_label(label):
+    """
+    Some sellers' giavang.org detail page (e.g. Bao Tin Manh Hai) lists
+    their silver products ("Bạc Thỏi...", "Bạc Nguyên liệu...") alongside
+    gold on the same per-seller page, since that seller trades both
+    metals. This flags a row as silver so it can be filtered out of the
+    "Vàng - Chi tiết" section, which should only ever show gold products.
+    """
+    return bool(re.match(r"^\s*bạc\b", (label or "").lower()))
+
+
 def fetch_seller_details():
     """
     Fetch + parse each seller's own detail page. Returns an ordered dict
@@ -1099,6 +1110,13 @@ def fetch_seller_details():
         try:
             html = fetch_page(url)
             tables = parse_comparison_tables(html)
+            filtered_out = sum(
+                1 for rows in tables for r in rows if _looks_like_silver_label(r["label"])
+            )
+            tables = [[r for r in rows if not _looks_like_silver_label(r["label"])] for rows in tables]
+            tables = [rows for rows in tables if rows]  # drop tables left empty after filtering
+            if filtered_out:
+                print(f"  Filtered {filtered_out} silver row(s) out of {name}'s gold detail page.")
             if not tables:
                 details[name] = {"error": "Could not parse any rows from this page.", "url": url}
             else:
