@@ -729,16 +729,23 @@ def parse_vcb_rate(html):
     Parse tygiausd.org's Vietcombank rate table for the USD row. Returns
     {"buy": int, "transfer": int, "sell": int} or None if the USD row
     wasn't found (page structure changed).
+
+    Scans every row of each table for one containing "Mã NT" rather than
+    assuming it's literally the first <tr> - the site now prepends a
+    title/caption row ("Tỷ Giá Vietcombank") above the real header row,
+    so table.find("tr") alone would grab the wrong row and miss the
+    table entirely.
     """
     soup = BeautifulSoup(html, "html.parser")
     for table in soup.find_all("table"):
-        header_row = table.find("tr")
-        if not header_row:
+        trs = table.find_all("tr")
+        header_idx = next(
+            (i for i, tr in enumerate(trs) if "Mã NT" in [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]),
+            None,
+        )
+        if header_idx is None:
             continue
-        header = [c.get_text(strip=True) for c in header_row.find_all(["td", "th"])]
-        if "Mã NT" not in header:
-            continue
-        for tr in table.find_all("tr")[1:]:
+        for tr in trs[header_idx + 1:]:
             cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
             if len(cells) >= 5 and cells[0] == "USD":
                 buy = _parse_vnd_number(_leading_grouped_number(cells[2]))
