@@ -1558,7 +1558,35 @@ def _row_icon_html(label, icon_kind, size=20):
     return _icon_img(kind, size)
 
 
-def _table_html(rows, label_header, tint=COLOR_GOLD_TINT, icon_kind=None):
+def _extremes_badge(kind):
+    if kind == "cheapest":
+        return f"<span style='background:{COLOR_GREEN_TINT};color:{COLOR_GREEN_ACCENT};font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:10px;margin-left:8px;white-space:nowrap;'>🏆 Rẻ nhất</span>"
+    return f"<span style='background:{COLOR_RED_TINT};color:{COLOR_RED_ACCENT};font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:10px;margin-left:8px;white-space:nowrap;'>📈 Đắt nhất</span>"
+
+
+def _price_spread_note(rows, sell_key="sell"):
+    """
+    One-line summary above a comparison table: the gap between the
+    cheapest and most expensive seller's sell price. Returns "" if fewer
+    than 2 rows have a parseable price (nothing to compare).
+    """
+    prices = [(r["label"], _parse_vnd_number(r[sell_key])) for r in rows]
+    prices = [(label, p) for label, p in prices if p is not None]
+    if len(prices) < 2:
+        return ""
+    cheapest = min(prices, key=lambda x: x[1])
+    priciest = max(prices, key=lambda x: x[1])
+    if cheapest[1] == priciest[1]:
+        return f"<p style='font-size:12.5px;color:{COLOR_MUTED};margin:0 0 10px;'>Tất cả các đơn vị đang niêm yết cùng một mức giá.</p>"
+    spread = priciest[1] - cheapest[1]
+    return (
+        f"<p style='font-size:12.5px;color:{COLOR_MUTED};margin:0 0 10px;'>"
+        f"Chênh lệch giữa đơn vị rẻ nhất ({escape(cheapest[0])}) và đắt nhất ({escape(priciest[0])}): "
+        f"<strong style='color:{COLOR_TEXT}'>{_format_vnd(spread)} đ</strong></p>"
+    )
+
+
+def _table_html(rows, label_header, tint=COLOR_GOLD_TINT, icon_kind=None, highlight_extremes=False):
     """
     icon_kind: pass a fixed icon name ("gold_bar"/"gold_ring") when every
     row in this table represents one seller (e.g. the gold summary
@@ -1568,18 +1596,37 @@ def _table_html(rows, label_header, tint=COLOR_GOLD_TINT, icon_kind=None):
     individually from its label text instead (e.g. the per-seller detail
     table, where rows are different gold product types like bars vs
     rings vs jewelry within the same table, not different sellers).
+
+    highlight_extremes: when True, badges the row(s) with the lowest and
+    highest sell price ("Rẻ nhất"/"Đắt nhất") and prepends a one-line
+    spread summary - meant for seller-comparison tables, not per-product
+    detail tables where "cheapest" isn't a meaningful comparison.
     """
+    cheapest_label = priciest_label = None
+    if highlight_extremes:
+        prices = [(r["label"], _parse_vnd_number(r["sell"])) for r in rows]
+        prices = [(label, p) for label, p in prices if p is not None]
+        if len(prices) >= 2 and min(p for _, p in prices) != max(p for _, p in prices):
+            cheapest_label = min(prices, key=lambda x: x[1])[0]
+            priciest_label = max(prices, key=lambda x: x[1])[0]
+
     def _row(i, r):
+        badge = ""
+        if r["label"] == cheapest_label:
+            badge = _extremes_badge("cheapest")
+        elif r["label"] == priciest_label:
+            badge = _extremes_badge("priciest")
         return (
             f"<tr style='background:{_tr_bg(i)}'>"
-            f"<td style='{_TD}'>{_row_icon_html(r['label'], icon_kind)}<strong>{escape(r['label'])}</strong>{_region_span(r['region'])}</td>"
+            f"<td style='{_TD}'>{_row_icon_html(r['label'], icon_kind)}<strong>{escape(r['label'])}</strong>{_region_span(r['region'])}{badge}</td>"
             f"<td style='{_TD}text-align:right;'>{escape(r['buy'])}</td>"
             f"<td style='{_TD}text-align:right;'>{escape(r['sell'])}</td>"
             f"</tr>"
         )
 
+    spread_note = _price_spread_note(rows) if highlight_extremes else ""
     body = "".join(_row(i, r) for i, r in enumerate(rows))
-    return _table_open([label_header, "Mua vào", "Bán ra"], ["left", "right", "right"], tint) + body + _TABLE_CLOSE
+    return spread_note + _table_open([label_header, "Mua vào", "Bán ra"], ["left", "right", "right"], tint) + body + _TABLE_CLOSE
 
 
 def _silver_table_html(rows):
@@ -1851,7 +1898,7 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
             if i > 0:
                 parts.append(f"<p style='font-size:13px;font-weight:700;color:{COLOR_MUTED};margin:16px 0 8px;'>{escape(label)}</p>")
             summary_icon_kind = "gold_bar" if i == 0 else ("gold_ring" if i == 1 else None)
-            parts.append(_table_html(rows, "Đơn vị bán", icon_kind=summary_icon_kind))
+            parts.append(_table_html(rows, "Đơn vị bán", icon_kind=summary_icon_kind, highlight_extremes=True))
         summary_html = "\n".join(parts)
 
     # --- Section 2: full detail per seller ---
