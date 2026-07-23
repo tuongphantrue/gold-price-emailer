@@ -1579,15 +1579,26 @@ CARD_STYLE = (
 )
 
 
-def _card(icon, title, accent, body_html):
+def _card(icon, title, accent, body_html, open_by_default=True):
+    """
+    Renders each section as a native <details>/<summary> - a real,
+    tap-to-collapse section with no JavaScript (email clients block JS
+    entirely, so that's not an option). Clients that support it (Apple
+    Mail, iOS Mail, newer Outlook) get an actual collapsible section;
+    clients that don't just render the content as a normal static block -
+    nothing breaks or gets hidden unrecoverably either way.
+    Defaults open so the email looks exactly as before until someone
+    taps a header to collapse it.
+    """
+    open_attr = " open" if open_by_default else ""
     return f"""
-    <div class="dm-card" style="{CARD_STYLE}">
-      <p class="dm-text" style="margin:0;font-size:16.5px;font-weight:700;color:#111827;font-family:{FONT_STACK};">
-        <span style="font-size:19px;margin-right:6px;">{icon}</span>{escape(title)}
-      </p>
-      <div style="height:3px;width:42px;background:{accent};border-radius:2px;margin:8px 0 16px;"></div>
+    <details{open_attr} class="dm-card email-card" style="{CARD_STYLE}">
+      <summary class="dm-text email-card-summary" style="margin:0;font-size:16.5px;font-weight:700;color:#111827;font-family:{FONT_STACK};cursor:pointer;list-style:none;">
+        <span style="font-size:19px;margin-right:6px;">{icon}</span>{escape(title)}<span class="email-chevron" style="float:right;color:{COLOR_MUTED};font-size:13px;">▾</span>
+      </summary>
+      <div style="height:3px;width:42px;background:{accent};border-radius:2px;margin:12px 0 16px;"></div>
       {body_html}
-    </div>"""
+    </details>"""
 
 
 def _tr_bg(i):
@@ -2126,6 +2137,10 @@ def build_html(summary_tables, details, silver, silver_details, price_changes, w
     <meta name="color-scheme" content="light dark">
     <meta name="supported-color-schemes" content="light dark">
     <style>
+      .email-card-summary::-webkit-details-marker {{ display:none; }}
+      .email-card-summary {{ list-style:none; }}
+      .email-chevron {{ transition:transform 0.15s ease; }}
+      .email-card[open] .email-chevron {{ transform:rotate(180deg); }}
       @media (prefers-color-scheme: dark) {{
         .dm-bg {{ background:#0f1115 !important; }}
         .dm-card {{ background:#1a1d24 !important; border-color:#2a2e37 !important; }}
