@@ -95,6 +95,33 @@ Both are optional - leave unset to keep the original "everything, 3%"
 behavior. Add them the same way as other secrets: Settings -> Secrets
 and variables -> Actions -> New repository secret.
 
+## AI-written market commentary
+
+Optional: set the `ANTHROPIC_API_KEY` repo secret and every email opens
+with a short (3-4 sentence) Vietnamese paragraph - actually written by
+Claude each run, summarizing that run's real numbers (SJC price, world
+gold move, domestic/world gap, biggest mover, any 30/90-day extremes).
+Not a template - genuinely generated prose grounded strictly in the data
+computed that run.
+
+**Setup:**
+1. Get an API key: https://console.anthropic.com/settings/keys
+2. Add it as a repo secret named `ANTHROPIC_API_KEY` (same process as the
+   other secrets: Settings -> Secrets and variables -> Actions -> New
+   repository secret)
+3. That's it - the section appears automatically once the key is set.
+
+**Cost:** uses Haiku by default (cheapest Claude model) - a few cents to
+maybe a dollar a month at the 30-minute schedule, depending on current
+pricing. Set the `COMMENTARY_MODEL` secret to `claude-sonnet-5` for
+richer/more nuanced writing at higher cost per run, or back to
+`claude-haiku-4-5-20251001` (the default) any time.
+
+**If unset:** the section is simply absent - no cost, no failed
+requests, no change to anything else. If the API call fails for any
+reason (bad key, rate limit, network issue) that run's email still sends
+normally, just without the commentary section that time.
+
 ## Your portfolio (holdings tracker)
 
 Set the `HOLDINGS_JSON` repo secret to a JSON list describing what you
