@@ -57,6 +57,10 @@ jobs:
           WATCHLIST: ${{ secrets.WATCHLIST }}
           ALERT_THRESHOLDS_JSON: ${{ secrets.ALERT_THRESHOLDS_JSON }}
           HOLDINGS_JSON: ${{ secrets.HOLDINGS_JSON }}
+          # Optional - AI-written market commentary. Leave unset to skip
+          # this section entirely (no cost, no behavior change).
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          COMMENTARY_MODEL: ${{ secrets.COMMENTARY_MODEL }}
         run: python gold_price_emailer.py generate
       - name: Publish updated state (dedup + price history)
         run: |
